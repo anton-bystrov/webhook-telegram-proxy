@@ -1,0 +1,63 @@
+{{- if gt .PartCount 1 -}}
+<b>Grafana alert batch {{ .PartIndex }}/{{ .PartCount }}</b>
+
+{{ end -}}
+<b>Status:</b> {{ orDash .Status }}
+<b>Receiver:</b> {{ orDash .Receiver }}
+<b>Alerts:</b> {{ .TotalAlerts }} (firing={{ .FiringCount }}, resolved={{ .ResolvedCount }})
+<b>Group key:</b> {{ orDash .GroupKey }}
+{{- if .Title }}
+<b>Title:</b> {{ .Title }}
+{{- end }}
+{{- if .Message }}
+<b>Message:</b> {{ .Message }}
+{{- end }}
+{{- if .ExternalURL }}
+<b>Source:</b> {{ .ExternalURL }}
+{{- end }}
+{{- if .CommonLabels }}
+<b>Common labels:</b> {{ joinPairs .CommonLabels }}
+{{- end }}
+{{- if .CommonAnnotations }}
+<b>Common annotations:</b> {{ joinPairs .CommonAnnotations }}
+{{- end }}
+
+{{- range .Alerts }}
+<b>Alert:</b> {{ orDash .Name }}
+<b>Severity:</b> {{ orDash .Severity }}
+<b>Alert status:</b> {{ orDash .Status }}
+{{- if .Summary }}
+<b>Summary:</b> {{ .Summary }}
+{{- end }}
+{{- if .Description }}
+<b>Description:</b> {{ .Description }}
+{{- end }}
+{{- if .StartsAt }}
+<b>Starts at:</b> {{ .StartsAt }}
+{{- end }}
+{{- if .EndsAt }}
+<b>Ends at:</b> {{ .EndsAt }}
+{{- end }}
+{{- if .GeneratorURL }}
+<b>Generator URL:</b> {{ .GeneratorURL }}
+{{- end }}
+{{- if .DashboardURL }}
+<b>Dashboard URL:</b> {{ .DashboardURL }}
+{{- end }}
+{{- if .PanelURL }}
+<b>Panel URL:</b> {{ .PanelURL }}
+{{- end }}
+{{- if .SilenceURL }}
+<b>Silence URL:</b> {{ .SilenceURL }}
+{{- end }}
+{{- if .ValueString }}
+<b>Values:</b> {{ .ValueString }}
+{{- end }}
+{{- if .Labels }}
+<b>Labels:</b> {{ joinPairs .Labels }}
+{{- end }}
+{{- if .Annotations }}
+<b>Annotations:</b> {{ joinPairs .Annotations }}
+{{- end }}
+
+{{- end }}
