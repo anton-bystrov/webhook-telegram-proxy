@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/anton-bystrov/webhook-telegram-proxy/internal/config"
 	transporthttp "github.com/anton-bystrov/webhook-telegram-proxy/internal/http"
@@ -45,6 +46,12 @@ func main() {
 	if err != nil {
 		logger.Error("initialize store", "error", err)
 		os.Exit(1)
+	}
+	if count, err := sqliteStore.RequeueSending(ctx, time.Now().UTC()); err != nil {
+		logger.Error("requeue sending deliveries after restart", "error", err)
+		os.Exit(1)
+	} else if count > 0 {
+		logger.Info("requeued sending deliveries after restart", "count", count)
 	}
 	defer func() {
 		if err := sqliteStore.Close(); err != nil {

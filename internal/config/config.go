@@ -159,6 +159,15 @@ func (c Config) Validate() error {
 	if c.MaxHeaderBytes <= 0 {
 		problems = append(problems, "max header bytes must be positive")
 	}
+	if c.HTTPReadTimeout <= 0 {
+		problems = append(problems, "http read timeout must be positive")
+	}
+	if c.HTTPWriteTimeout <= 0 {
+		problems = append(problems, "http write timeout must be positive")
+	}
+	if c.HTTPShutdownTimeout <= 0 {
+		problems = append(problems, "http shutdown timeout must be positive")
+	}
 	if c.HTTPIdleTimeout <= 0 {
 		problems = append(problems, "http idle timeout must be positive")
 	}

@@ -60,6 +60,19 @@ func TestValidateRejectsPartialBasicAuthConfig(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsNonPositiveHTTPTimeouts(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_TEMPLATE_PATH", "templates/telegram_alert.tmpl")
+	t.Setenv("STORE_PATH", "data/test.db")
+	t.Setenv("HTTP_WRITE_TIMEOUT", "0s")
+
+	_, err := Parse([]string{})
+	if err == nil {
+		t.Fatal("expected validation error for non-positive HTTP timeout")
+	}
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)

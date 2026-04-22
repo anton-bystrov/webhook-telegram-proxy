@@ -28,14 +28,15 @@ This is useful when you need more than a simple "receive JSON and call Telegram"
 ## Features
 
 - `POST /webhook/grafana` for Grafana webhooks
-- `GET /health` for service and store health checks
+- `GET /health` and `GET /readyz` for service and store readiness checks
+- `GET /livez` for process liveness checks
 - `GET /metrics` for Prometheus scraping
 - persistent SQLite-backed outbox
 - `at-least-once` delivery with retry and restart recovery
 - deduplication of identical webhooks via fingerprinting
 - external Telegram message template via `templates/telegram_alert.tmpl`
 - automatic splitting of oversized Telegram messages
-- optional Basic Auth for all endpoints
+- optional Basic Auth for admin endpoints and as a fallback for the webhook
 - dedicated webhook protection through `X-Webhook-Secret`
 - safer HTTP defaults: request body limit, header size limit, security headers, constant-time secret comparison
 - bounded local store with watermark-based safe cleanup
@@ -140,8 +141,9 @@ https://your-host.example/webhook/grafana
 X-Webhook-Secret: change-me
 ```
 
-5. If Basic Auth is enabled, configure HTTP Basic Auth in Grafana.
-6. Keep the default webhook body unless you intentionally change the supported payload structure.
+5. If `WEBHOOK_SECRET` is configured, Grafana only needs the `X-Webhook-Secret` header.
+6. If `WEBHOOK_SECRET` is not configured and Basic Auth is enabled, configure HTTP Basic Auth in Grafana.
+7. Keep the default webhook body unless you intentionally change the supported payload structure.
 
 ### 5. Verify end to end
 
@@ -155,7 +157,7 @@ curl -X POST http://127.0.0.1:8080/webhook/grafana \
   --data @sample-grafana-payload.json
 ```
 
-If Basic Auth is disabled, omit `-u`.
+If `WEBHOOK_SECRET` is configured, omit `-u`. If `WEBHOOK_SECRET` is not configured and Basic Auth is enabled, omit the header and keep `-u`.
 
 ## Architecture in Plain English
 
@@ -225,7 +227,9 @@ Important notes:
 
 - mount `templates` separately so you can change the template without rebuilding the image;
 - mount `data` to persistent storage, otherwise the SQLite file is lost when the container is removed;
-- if Basic Auth is enabled, it protects `GET /metrics`, `GET /health`, and `POST /webhook/grafana`.
+- if Basic Auth is enabled, it protects `GET /health`, `GET /readyz`, and `GET /metrics`;
+- `GET /livez` is intentionally unauthenticated for liveness probes;
+- `POST /webhook/grafana` uses `X-Webhook-Secret` when configured, and falls back to Basic Auth only when the webhook secret is not set.
 
 ### Run as a systemd service
 
@@ -352,7 +356,7 @@ For production use, these are good defaults:
 1. Always enable `WEBHOOK_SECRET`.
 2. Enable `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD` if the service is reachable outside a trusted network.
 3. Put the service behind HTTPS termination or a reverse proxy.
-4. Restrict network access to `/metrics` and `/health` when possible, even if Basic Auth is already enabled.
+4. Restrict network access to `/metrics`, `/health`, and `/readyz` when possible, even if Basic Auth is already enabled.
 5. Never commit `.env` files or bot tokens to source control.
 6. Use a dedicated Telegram bot for this integration.
 
@@ -375,7 +379,7 @@ Recommended contact point settings:
 - `URL`: `https://proxy.example/webhook/grafana`
 - `HTTP Method`: `POST`
 - `Extra Header`: `X-Webhook-Secret: <your-secret>`
-- `Authentication`: Basic Auth if you enabled it in the service
+- `Authentication`: only if you intentionally run without `WEBHOOK_SECRET` and rely on Basic Auth fallback
 - `Custom Payload`: disabled unless you intentionally adapt the payload format
 
 If you radically change the webhook body structure in Grafana, the service may stop extracting alert fields correctly.
@@ -434,7 +438,7 @@ Request requirements:
 - method: `POST`
 - `Content-Type: application/json`
 - `X-Webhook-Secret` header if `WEBHOOK_SECRET` is configured
-- Basic Auth if enabled
+- Basic Auth only if `WEBHOOK_SECRET` is not configured and Basic Auth is enabled
 
 Example successful response:
 
@@ -449,10 +453,10 @@ Example successful response:
 
 Possible response codes:
 
-- `200 OK`: accepted and already delivered, or already delivered duplicate
+- `200 OK`: delivered successfully, duplicate of an already known event, or terminally finished with `failed` / `dead_letter`
 - `202 Accepted`: duplicate of an event that is still being worked on or has been requeued
 - `400 Bad Request`: invalid JSON
-- `401 Unauthorized`: invalid `X-Webhook-Secret` or invalid Basic Auth credentials
+- `401 Unauthorized`: invalid `X-Webhook-Secret`, or invalid Basic Auth credentials when running in Basic Auth fallback mode
 - `413 Payload Too Large`: request body exceeds the configured limit
 - `415 Unsupported Media Type`: `Content-Type` is not `application/json`
 - `502 Bad Gateway`: Telegram or the network path to Telegram is temporarily unavailable, delivery will be retried
@@ -488,6 +492,28 @@ Example response:
 - `store_pressure`: store size has crossed a critical threshold
 - `unhealthy`: SQLite is unavailable or the health check itself failed
 
+If Basic Auth is enabled, this endpoint is protected.
+
+### `GET /readyz`
+
+Purpose: readiness probe. It uses the same logic and response shape as `GET /health`.
+
+If Basic Auth is enabled, this endpoint is protected.
+
+### `GET /livez`
+
+Purpose: liveness probe. This endpoint only confirms that the process is responsive and does not touch SQLite or Telegram.
+
+Example response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+This endpoint is intentionally never protected by Basic Auth so kubelet-style liveness probes can always reach it.
+
 ### `GET /metrics`
 
 Exposes Prometheus metrics. If Basic Auth is enabled, this endpoint is protected as well.
@@ -515,6 +541,8 @@ Delivery statuses used by the store:
 - `dead_letter`
 
 When an identical webhook is received again, the service computes a fingerprint and avoids duplicate delivery whenever possible.
+
+If a record has already reached `failed` or `dead_letter`, receiving the same webhook again does not automatically requeue it. This prevents an upstream retry loop from turning a terminal delivery outcome into repeated duplicate sends.
 
 ## Local Store and Safe Rotation
 
@@ -681,8 +709,8 @@ Operationally, the most useful things to watch are:
 Check:
 
 - whether `X-Webhook-Secret` matches;
-- whether Basic Auth is enabled in the service;
-- if it is enabled, whether Grafana is using the correct username and password.
+- if `WEBHOOK_SECRET` is not configured, whether Basic Auth is enabled in the service;
+- if running in Basic Auth fallback mode, whether Grafana is using the correct username and password.
 
 ### Grafana gets `415 Unsupported Media Type`
 
@@ -698,6 +726,7 @@ Possible reasons:
 Check:
 
 - `GET /health`;
+- `GET /readyz`;
 - the size of the `data/` directory;
 - metrics `grafana_telegram_proxy_store_size_bytes` and `grafana_telegram_proxy_store_disk_pressure`.
 
@@ -738,6 +767,12 @@ Check health:
 
 ```bash
 curl -u admin:very-strong-password http://127.0.0.1:8080/health
+```
+
+Check liveness:
+
+```bash
+curl http://127.0.0.1:8080/livez
 ```
 
 Check webhook delivery:

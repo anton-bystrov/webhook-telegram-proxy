@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -71,31 +72,20 @@ func (s *AlertService) AcceptWebhook(ctx context.Context, raw []byte) (AcceptRes
 			}, 200, nil
 		}
 		if existing.Status == store.StatusFailed || existing.Status == store.StatusDeadLetter {
-			if err := s.store.Requeue(ctx, existing.EventID, s.now().UTC()); err != nil {
-				return AcceptResult{}, 500, fmt.Errorf("requeue failed event: %w", err)
-			}
-		}
-		if err := s.delivery.ProcessEventByID(ctx, existing.EventID); err != nil {
-			s.metrics.WebhookEventsReceivedTotal.WithLabelValues("duplicate_retry").Inc()
+			s.metrics.WebhookEventsReceivedTotal.WithLabelValues("duplicate_terminal").Inc()
 			return AcceptResult{
 				EventID:        existing.EventID,
 				IdempotencyKey: existing.IdempotencyKey,
-				Status:         store.StatusRetryScheduled,
+				Status:         existing.Status,
 				Duplicate:      true,
-			}, 502, err
+			}, http.StatusOK, nil
 		}
-
-		record, _, lookupErr := s.store.GetByEventID(ctx, existing.EventID)
-		if lookupErr != nil {
-			return AcceptResult{}, 500, lookupErr
+		if err := s.delivery.ProcessEventByID(ctx, existing.EventID); err != nil {
+			s.metrics.WebhookEventsReceivedTotal.WithLabelValues("duplicate_pending").Inc()
+			return s.loadAcceptResult(ctx, existing.EventID, existing.IdempotencyKey, true)
 		}
 		s.metrics.WebhookEventsReceivedTotal.WithLabelValues("duplicate_pending").Inc()
-		return AcceptResult{
-			EventID:        existing.EventID,
-			IdempotencyKey: existing.IdempotencyKey,
-			Status:         record.Status,
-			Duplicate:      true,
-		}, 202, nil
+		return s.loadAcceptResult(ctx, existing.EventID, existing.IdempotencyKey, true)
 	}
 
 	now := s.now().UTC()
@@ -124,28 +114,51 @@ func (s *AlertService) AcceptWebhook(ctx context.Context, raw []byte) (AcceptRes
 	}
 
 	if err := s.delivery.ProcessEventByID(ctx, eventID); err != nil {
-		s.metrics.WebhookEventsReceivedTotal.WithLabelValues("queued_retry").Inc()
-		return AcceptResult{
-			EventID:        eventID,
-			IdempotencyKey: idempotencyKey,
-			Status:         store.StatusRetryScheduled,
-		}, 502, err
-	}
-
-	record, found, err = s.store.GetByEventID(ctx, eventID)
-	if err != nil {
-		return AcceptResult{}, 500, fmt.Errorf("reload delivery: %w", err)
-	}
-	if !found {
-		return AcceptResult{}, 500, fmt.Errorf("delivery record %s not found after processing", eventID)
+		result, statusCode, loadErr := s.loadAcceptResult(ctx, eventID, idempotencyKey, false)
+		if loadErr != nil {
+			return AcceptResult{}, http.StatusInternalServerError, loadErr
+		}
+		switch result.Status {
+		case store.StatusRetryScheduled:
+			s.metrics.WebhookEventsReceivedTotal.WithLabelValues("queued_retry").Inc()
+			return result, http.StatusBadGateway, err
+		case store.StatusFailed, store.StatusDeadLetter:
+			s.metrics.WebhookEventsReceivedTotal.WithLabelValues("terminal_failure").Inc()
+			return result, http.StatusOK, nil
+		default:
+			s.metrics.WebhookEventsReceivedTotal.WithLabelValues("queued_pending").Inc()
+			return result, statusCode, nil
+		}
 	}
 
 	s.metrics.WebhookEventsReceivedTotal.WithLabelValues("success").Inc()
-	return AcceptResult{
+	return s.loadAcceptResult(ctx, eventID, idempotencyKey, false)
+}
+
+func (s *AlertService) loadAcceptResult(ctx context.Context, eventID, idempotencyKey string, duplicate bool) (AcceptResult, int, error) {
+	record, found, err := s.store.GetByEventID(ctx, eventID)
+	if err != nil {
+		return AcceptResult{}, http.StatusInternalServerError, fmt.Errorf("reload delivery: %w", err)
+	}
+	if !found {
+		return AcceptResult{}, http.StatusInternalServerError, fmt.Errorf("delivery record %s not found after processing", eventID)
+	}
+
+	result := AcceptResult{
 		EventID:        eventID,
 		IdempotencyKey: idempotencyKey,
 		Status:         record.Status,
-	}, 200, nil
+		Duplicate:      duplicate,
+	}
+
+	switch record.Status {
+	case store.StatusDelivered, store.StatusFailed, store.StatusDeadLetter:
+		return result, http.StatusOK, nil
+	case store.StatusReceived, store.StatusQueued, store.StatusSending, store.StatusRetryScheduled:
+		return result, http.StatusAccepted, nil
+	default:
+		return AcceptResult{}, http.StatusInternalServerError, fmt.Errorf("unexpected delivery status %q", record.Status)
+	}
 }
 
 func ComputeFingerprint(payload models.WebhookPayload) string {
