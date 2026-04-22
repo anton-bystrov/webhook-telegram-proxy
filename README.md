@@ -40,6 +40,8 @@ This is useful when you need more than a simple "receive JSON and call Telegram"
 - dedicated webhook protection through `X-Webhook-Secret`
 - safer HTTP defaults: request body limit, header size limit, security headers, constant-time secret comparison
 - bounded local store with watermark-based safe cleanup
+- versioned release pipeline for binaries, `.deb`, `.rpm`, and Docker images
+- `CHANGELOG.md` and tag-driven releases based on SemVer
 
 ## Delivery Model Limitations
 
@@ -63,6 +65,8 @@ For `v1`, a delivery is considered successful when Telegram Bot API returns `ok=
 
 - Go `1.22+` if you want to run the service as a binary
 - Docker if you want to run the container image
+- Docker Buildx if you want to build multi-platform images locally
+- GoReleaser if you want local snapshot packaging without GitHub Actions
 - access to the Telegram Bot API
 - Grafana with Unified Alerting webhook contact points
 - persistent storage for SQLite if you run the service in a container
@@ -94,6 +98,13 @@ Minimum configuration to start:
 TELEGRAM_BOT_TOKEN=replace-me
 TELEGRAM_CHAT_ID=-1001234567890
 WEBHOOK_SECRET=change-me
+```
+
+Optional Telegram egress overrides:
+
+```dotenv
+TELEGRAM_PROXY_URL=socks5://user:pass@proxy.internal.example:1080
+TELEGRAM_BASE_URL=https://botapi.internal.example
 ```
 
 If the service is reachable outside a trusted internal network, enable Basic Auth:
@@ -170,7 +181,62 @@ The service has a few simple layers:
 - the template renderer loads the external template and injects alert data;
 - Prometheus metrics expose queue, retry, store, and Telegram API behavior.
 
+## Distribution and Release Assets
+
+Tagged releases publish versioned artifacts for:
+
+- Linux binaries: `amd64`, `arm64`, `armv7`
+- macOS binaries: `amd64`, `arm64`
+- Windows binary: `amd64`
+- Linux packages: `.deb` and `.rpm` for `amd64`, `arm64`, and `armv7`
+- Multi-platform Docker image: `linux/amd64`, `linux/arm64`, `linux/arm/v7`
+
+Binary archives, packages, and checksums are attached to the GitHub Release.
+Container images are published to:
+
+```text
+ghcr.io/anton-bystrov/webhook-telegram-proxy
+```
+
+Version tags use Semantic Versioning:
+
+```text
+vX.Y.Z
+```
+
+Release notes come from GoReleaser git changelog generation, while `CHANGELOG.md`
+remains the human-readable project history.
+
 ## Running the Service
+
+### Local developer commands
+
+The repository includes a `Makefile` for the most common release and validation
+tasks:
+
+```bash
+make fmt
+make test
+make vet
+make build
+make changelog
+make release-check
+make snapshot
+make docker-build
+make docker-buildx
+```
+
+What these commands do:
+
+- `make build`: build the current-platform binary into `dist/`
+- `make snapshot`: build versioned archives plus `.deb` and `.rpm` packages into `dist/`
+- `make release-check`: validate `.goreleaser.yaml`
+- `make changelog`: generate a draft changelog file at `dist/CHANGELOG.next.md`
+- `make docker-build`: build a local Docker image with the standard Docker builder
+- `make docker-buildx`: build a multi-platform OCI image archive at `dist/`
+
+If `goreleaser` is not installed locally, the helper script falls back to
+running GoReleaser through Docker.
 
 ### Run as a regular binary
 
@@ -197,6 +263,8 @@ Or use CLI flags:
   --app-port 8080 \
   --telegram-bot-token "$TELEGRAM_BOT_TOKEN" \
   --telegram-chat-id "$TELEGRAM_CHAT_ID" \
+  --telegram-proxy-url "$TELEGRAM_PROXY_URL" \
+  --telegram-base-url "$TELEGRAM_BASE_URL" \
   --webhook-secret "$WEBHOOK_SECRET" \
   --alert-template-path templates/telegram_alert.tmpl \
   --store-path data/webhook-telegram-proxy.db
@@ -233,7 +301,7 @@ Important notes:
 
 ### Run as a systemd service
 
-The repository includes an example unit file: `deploy/webhook-telegram-proxy.service`.
+The repository includes an example unit file: `packaging/systemd/webhook-telegram-proxy.service`.
 
 One practical setup looks like this:
 
@@ -255,6 +323,8 @@ sudo useradd --system --home /opt/webhook-telegram-proxy --shell /usr/sbin/nolog
 sudo tee /etc/webhook-telegram-proxy.env >/dev/null <<'EOF'
 TELEGRAM_BOT_TOKEN=replace-me
 TELEGRAM_CHAT_ID=-1001234567890
+TELEGRAM_PROXY_URL=socks5://user:pass@proxy.internal.example:1080
+TELEGRAM_BASE_URL=
 WEBHOOK_SECRET=change-me
 BASIC_AUTH_USERNAME=admin
 BASIC_AUTH_PASSWORD=very-strong-password
@@ -264,7 +334,7 @@ EOF
 4. Install the unit file:
 
 ```bash
-sudo cp deploy/webhook-telegram-proxy.service /etc/systemd/system/
+sudo cp packaging/systemd/webhook-telegram-proxy.service /etc/systemd/system/
 ```
 
 5. Reload and start:
@@ -291,6 +361,8 @@ The main settings are listed below. See `.env.example` for a complete example.
 | --- | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | `--telegram-bot-token` | none | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | `--telegram-chat-id` | none | Target channel, chat, or group ID |
+| `TELEGRAM_BASE_URL` | `--telegram-base-url` | empty | Override the Telegram Bot API base URL, for example for a self-hosted `telegram-bot-api` instance |
+| `TELEGRAM_PROXY_URL` | `--telegram-proxy-url` | empty | Explicit proxy URL for Telegram Bot API egress. Supported schemes: `http`, `https`, `socks5` |
 
 ### Core server settings
 
@@ -368,6 +440,61 @@ The application already includes:
 - header size limits;
 - defensive HTTP security headers;
 - more careful public error responses with reduced internal leakage.
+
+## Telegram Proxy and Restricted-Region Deployments
+
+The Telegram client supports these outbound modes:
+
+- direct connection with the standard Go transport;
+- explicit `http://` proxy;
+- explicit `https://` proxy;
+- explicit `socks5://` proxy;
+- custom `TELEGRAM_BASE_URL` for a self-hosted `telegram-bot-api` endpoint.
+
+Examples:
+
+```dotenv
+TELEGRAM_PROXY_URL=http://proxy.internal.example:3128
+TELEGRAM_PROXY_URL=https://user:pass@proxy.internal.example:8443
+TELEGRAM_PROXY_URL=socks5://user:pass@proxy.internal.example:1080
+TELEGRAM_BASE_URL=https://botapi.internal.example
+```
+
+Operational notes:
+
+- `TELEGRAM_PROXY_URL` takes precedence over `HTTP_PROXY`, `HTTPS_PROXY`, and related environment variables for Telegram requests;
+- proxy credentials are redacted from logs and returned errors;
+- bot tokens remain redacted from client errors;
+- invalid proxy schemes fail fast during startup instead of silently falling back.
+
+### Why MTProto Is Not Exposed Here
+
+This service sends alerts through the HTTP Telegram Bot API. `MTProto` proxies are designed for the Telegram client protocol and are not a drop-in transport for the Bot API HTTP endpoint used here. For that reason, `mtproto://...` is rejected during startup instead of being accepted as a misleading configuration.
+
+### Recommended Alternatives for Restricted Regions
+
+1. `SOCKS5` proxy.
+   Usually the best first option when only Telegram egress needs help.
+
+2. `HTTP` or `HTTPS` proxy.
+   A good fit when your environment already standardizes on outbound web proxies.
+
+3. Self-hosted `telegram-bot-api` plus `TELEGRAM_BASE_URL`.
+   Useful when you want stronger control over the upstream hop and better local observability.
+
+4. Host-level or network-level egress through `WireGuard` or another VPN.
+   Often the cleanest option when multiple services in the same environment need reliable outbound Telegram access.
+
+5. A relay service in another region.
+   Good when the monitored environment can reach one controlled HTTPS endpoint but not Telegram directly.
+
+Quick comparison:
+
+- `SOCKS5 proxy`: low operational complexity, good reliability, recommended first option.
+- `HTTP/HTTPS proxy`: low-to-medium complexity, strong fit for enterprise networks, but more dependent on proxy policy and TLS inspection behavior.
+- `Self-hosted Bot API`: medium complexity, best control over egress and observability, requires extra infrastructure.
+- `WireGuard/VPN egress`: medium complexity, best platform-wide reachability story, often cleaner than per-app proxy sprawl.
+- `Regional relay`: medium-to-high complexity, flexible and resilient, but introduces another service to secure and operate.
 
 ## Grafana Configuration
 
@@ -736,6 +863,7 @@ Check:
 
 - `TELEGRAM_BOT_TOKEN`;
 - `TELEGRAM_CHAT_ID`;
+- `TELEGRAM_PROXY_URL` or `TELEGRAM_BASE_URL` if you route Telegram traffic through a proxy or self-hosted Bot API;
 - whether the bot was added to the channel;
 - whether the bot has permission to post;
 - metrics `telegram_api_requests_total`, `delivery_retries_total`, and `delivery_dead_letter_total`.
@@ -803,7 +931,7 @@ curl -u admin:very-strong-password http://127.0.0.1:8080/metrics
 - `internal/telegram` — Telegram Bot API client
 - `internal/metrics` — Prometheus collectors
 - `templates/telegram_alert.tmpl` — default message template
-- `deploy/webhook-telegram-proxy.service` — example systemd unit
+- `packaging/systemd/webhook-telegram-proxy.service` — example systemd unit
 
 ## What to Configure First
 
@@ -815,6 +943,7 @@ If this is your first deployment, start with these settings:
 4. `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD`
 5. `STORE_PATH` on persistent storage
 6. `ALERT_TEMPLATE_PATH` if you want to customize message formatting
+7. `TELEGRAM_PROXY_URL` or `TELEGRAM_BASE_URL` if Telegram is restricted in your region or network
 
 ## Possible Future Improvements
 

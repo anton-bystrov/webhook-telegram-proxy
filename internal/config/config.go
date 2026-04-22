@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -45,6 +46,8 @@ type Config struct {
 	Environment                string
 	TelegramBotToken           string
 	TelegramChatID             string
+	TelegramBaseURL            string
+	TelegramProxyURL           string
 	WebhookSecret              string
 	BasicAuthUsername          string
 	BasicAuthPassword          string
@@ -84,6 +87,8 @@ func Parse(args []string) (Config, error) {
 	fs.StringVar(&cfg.Environment, "environment", envString("ENVIRONMENT", defaultEnvironment), "environment name")
 	fs.StringVar(&cfg.TelegramBotToken, "telegram-bot-token", envString("TELEGRAM_BOT_TOKEN", ""), "Telegram bot token")
 	fs.StringVar(&cfg.TelegramChatID, "telegram-chat-id", envString("TELEGRAM_CHAT_ID", ""), "Telegram chat or channel id")
+	fs.StringVar(&cfg.TelegramBaseURL, "telegram-base-url", envString("TELEGRAM_BASE_URL", ""), "override Telegram Bot API base URL")
+	fs.StringVar(&cfg.TelegramProxyURL, "telegram-proxy-url", envString("TELEGRAM_PROXY_URL", ""), "explicit proxy URL for Telegram Bot API requests")
 	fs.StringVar(&cfg.WebhookSecret, "webhook-secret", envString("WEBHOOK_SECRET", ""), "shared secret for webhook authentication")
 	fs.StringVar(&cfg.BasicAuthUsername, "basic-auth-username", envString("BASIC_AUTH_USERNAME", ""), "optional HTTP basic auth username")
 	fs.StringVar(&cfg.BasicAuthPassword, "basic-auth-password", envString("BASIC_AUTH_PASSWORD", ""), "optional HTTP basic auth password")
@@ -140,6 +145,12 @@ func (c Config) Validate() error {
 	}
 	if c.TelegramChatID == "" {
 		problems = append(problems, "telegram chat id is required")
+	}
+	if err := validateTelegramBaseURL(c.TelegramBaseURL); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if err := validateTelegramProxyURL(c.TelegramProxyURL); err != nil {
+		problems = append(problems, err.Error())
 	}
 	if c.AlertTemplatePath == "" {
 		problems = append(problems, "alert template path is required")
@@ -269,4 +280,60 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return value
+}
+
+func validateTelegramBaseURL(rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse telegram base URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("telegram base URL scheme %q is not supported", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return errors.New("telegram base URL must include a host")
+	}
+	if parsed.User != nil {
+		return errors.New("telegram base URL must not contain credentials")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("telegram base URL must not contain query parameters or fragments")
+	}
+
+	return nil
+}
+
+func validateTelegramProxyURL(rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse telegram proxy URL: %w", err)
+	}
+	if parsed.Host == "" {
+		return errors.New("telegram proxy URL must include a host")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("telegram proxy URL must not contain query parameters or fragments")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return errors.New("telegram proxy URL must not contain a path")
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5":
+		return nil
+	case "mtproto":
+		return errors.New("mtproto proxies are not supported for the HTTP Telegram Bot API client; use socks5/http(s), a local Bot API server, or network-level egress instead")
+	default:
+		return fmt.Errorf("telegram proxy URL scheme %q is not supported", parsed.Scheme)
+	}
 }

@@ -1,0 +1,142 @@
+version: 2
+
+project_name: webhook-telegram-proxy
+
+dist: dist
+
+before:
+  hooks:
+    - go test ./...
+    - go vet ./...
+
+builds:
+  - id: linux
+    main: ./cmd/server
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.revision={{ .Commit }} -X main.buildDate={{ .Date }}
+  - id: linux-armv7
+    main: ./cmd/server
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - arm
+    goarm:
+      - "7"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.revision={{ .Commit }} -X main.buildDate={{ .Date }}
+  - id: darwin
+    main: ./cmd/server
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.revision={{ .Commit }} -X main.buildDate={{ .Date }}
+  - id: windows
+    main: ./cmd/server
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.revision={{ .Commit }} -X main.buildDate={{ .Date }}
+
+archives:
+  - id: binaries
+    ids:
+      - linux
+      - linux-armv7
+      - darwin
+      - windows
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ if eq .Arch `amd64` }}x86_64{{ else if eq .Arch `386` }}i386{{ else }}{{ .Arch }}{{ end }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ if .Version }}{{ .Version }}-snapshot{{ else }}0.0.0-snapshot{{ end }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^Merge "
+
+release:
+  github:
+    owner: anton-bystrov
+    name: webhook-telegram-proxy
+  draft: false
+  prerelease: auto
+
+nfpms:
+  - id: linux-packages
+    package_name: webhook-telegram-proxy
+    vendor: Anton Bystrov
+    homepage: https://github.com/anton-bystrov/webhook-telegram-proxy
+    maintainer: Anton Bystrov <anton-bystrov@users.noreply.github.com>
+    description: Reliable Grafana webhook to Telegram proxy with SQLite-backed outbox, retries, and Prometheus metrics.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    file_name_template: "{{ .ConventionalFileName }}"
+    contents:
+      - src: ./packaging/systemd/webhook-telegram-proxy.service
+        dst: /usr/lib/systemd/system/webhook-telegram-proxy.service
+      - src: ./templates/telegram_alert.tmpl
+        dst: /usr/share/webhook-telegram-proxy/templates/telegram_alert.tmpl
+      - src: ./.env.example
+        dst: /usr/share/doc/webhook-telegram-proxy/webhook-telegram-proxy.env.example
+      - src: ./README.md
+        dst: /usr/share/doc/webhook-telegram-proxy/README.md
+      - src: ./LICENSE
+        dst: /usr/share/doc/webhook-telegram-proxy/LICENSE
+      - dst: /etc/webhook-telegram-proxy
+        type: dir
+      - dst: /usr/share/webhook-telegram-proxy/templates
+        type: dir
+      - dst: /var/lib/webhook-telegram-proxy
+        type: dir
+    scripts:
+      postinstall: ./packaging/scripts/postinstall.sh
+      postremove: ./packaging/scripts/postremove.sh
+    overrides:
+      deb:
+        dependencies:
+          - systemd
+      rpm:
+        dependencies:
+          - systemd

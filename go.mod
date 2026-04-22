@@ -4,6 +4,7 @@ go 1.22.0
 
 require (
 	github.com/prometheus/client_golang v1.20.5
+	golang.org/x/net v0.27.0
 	modernc.org/sqlite v1.34.5
 )
 
