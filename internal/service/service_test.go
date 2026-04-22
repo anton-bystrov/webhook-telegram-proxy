@@ -46,7 +46,7 @@ func (f *fakeTelegramClient) Calls() int {
 }
 
 func TestAcceptWebhookSuccessfulDelivery(t *testing.T) {
-	deps := newServiceDeps(t, fakeTelegramClient{
+	deps := newServiceDeps(t, &fakeTelegramClient{
 		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 1, ChatID: -100123}}},
 	})
 
@@ -77,7 +77,7 @@ func TestAcceptWebhookSuccessfulDelivery(t *testing.T) {
 }
 
 func TestAcceptWebhookInvalidJSON(t *testing.T) {
-	deps := newServiceDeps(t, fakeTelegramClient{})
+	deps := newServiceDeps(t, &fakeTelegramClient{})
 
 	_, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(`{`))
 	if err == nil {
@@ -89,7 +89,7 @@ func TestAcceptWebhookInvalidJSON(t *testing.T) {
 }
 
 func TestDuplicateDeliveredWebhookDoesNotResend(t *testing.T) {
-	deps := newServiceDeps(t, fakeTelegramClient{
+	deps := newServiceDeps(t, &fakeTelegramClient{
 		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 11, ChatID: -100123}}},
 	})
 
@@ -112,7 +112,7 @@ func TestDuplicateDeliveredWebhookDoesNotResend(t *testing.T) {
 }
 
 func TestRetryableTelegramErrorSchedulesRetry(t *testing.T) {
-	deps := newServiceDeps(t, fakeTelegramClient{
+	deps := newServiceDeps(t, &fakeTelegramClient{
 		responses: []fakeTelegramResult{{
 			err: &telegram.APIError{StatusCode: 500, Description: "upstream failed", Retryable: true},
 		}},
@@ -140,7 +140,7 @@ func TestRetryableTelegramErrorSchedulesRetry(t *testing.T) {
 }
 
 func TestDeadLetterAfterMaxAttempts(t *testing.T) {
-	deps := newServiceDeps(t, fakeTelegramClient{
+	deps := newServiceDeps(t, &fakeTelegramClient{
 		responses: []fakeTelegramResult{{
 			err: &telegram.APIError{StatusCode: 500, Description: "retryable", Retryable: true},
 		}},
@@ -148,9 +148,12 @@ func TestDeadLetterAfterMaxAttempts(t *testing.T) {
 	deps.cfg.MaxDeliveryAttempts = 1
 	deps.delivery.cfg.MaxDeliveryAttempts = 1
 
-	result, _, err := deps.alerts.AcceptWebhook(context.Background(), []byte(samplePayload))
-	if err == nil {
-		t.Fatal("expected dead-letter error")
+	result, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(samplePayload))
+	if err != nil {
+		t.Fatalf("AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
 	}
 
 	record, found, lookupErr := deps.store.GetByEventID(context.Background(), result.EventID)
@@ -165,11 +168,49 @@ func TestDeadLetterAfterMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestDuplicateDeadLetterWebhookDoesNotRequeue(t *testing.T) {
+	deps := newServiceDeps(t, &fakeTelegramClient{
+		responses: []fakeTelegramResult{{
+			err: &telegram.APIError{StatusCode: 500, Description: "retryable", Retryable: true},
+		}},
+	})
+	deps.cfg.MaxDeliveryAttempts = 1
+	deps.delivery.cfg.MaxDeliveryAttempts = 1
+
+	first, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(samplePayload))
+	if err != nil {
+		t.Fatalf("first AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+
+	second, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(samplePayload))
+	if err != nil {
+		t.Fatalf("second AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+	if !second.Duplicate {
+		t.Fatal("expected duplicate result")
+	}
+	if second.Status != store.StatusDeadLetter {
+		t.Fatalf("expected duplicate status dead_letter, got %s", second.Status)
+	}
+	if second.EventID != first.EventID {
+		t.Fatalf("expected same event id, got %s and %s", first.EventID, second.EventID)
+	}
+	if deps.client.Calls() != 1 {
+		t.Fatalf("expected a single Telegram send, got %d", deps.client.Calls())
+	}
+}
+
 func TestRecoveryProcessesPendingAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "store.db")
 
-	firstClient := fakeTelegramClient{
+	firstClient := &fakeTelegramClient{
 		responses: []fakeTelegramResult{{
 			err: &telegram.APIError{StatusCode: 500, Description: "temporary", Retryable: true},
 		}},
@@ -187,7 +228,7 @@ func TestRecoveryProcessesPendingAfterRestart(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	secondClient := fakeTelegramClient{
+	secondClient := &fakeTelegramClient{
 		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 22, ChatID: -100123}}},
 	}
 	second := newServiceDepsAtPath(t, dbPath, secondClient)
@@ -208,8 +249,64 @@ func TestRecoveryProcessesPendingAfterRestart(t *testing.T) {
 	}
 }
 
+func TestRestartRequeuesSendingRecords(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "store.db")
+
+	first := newServiceDepsAtPath(t, dbPath, &fakeTelegramClient{})
+
+	old := time.Now().Add(-time.Hour).UTC()
+	lastAttempt := old
+	sending := store.Record{
+		EventID:         "sending",
+		IdempotencyKey:  "sending-key",
+		Status:          store.StatusSending,
+		OriginalPayload: []byte(samplePayload),
+		CreatedAt:       old,
+		UpdatedAt:       old,
+		LastAttemptAt:   &lastAttempt,
+	}
+	if err := first.store.CreateReceived(context.Background(), sending); err != nil {
+		t.Fatalf("CreateReceived() error = %v", err)
+	}
+	if err := first.store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	client := &fakeTelegramClient{
+		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 33, ChatID: -100123}}},
+	}
+	second := newServiceDepsAtPath(t, dbPath, client)
+
+	requeued, err := second.store.RequeueSending(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RequeueSending() error = %v", err)
+	}
+	if requeued != 1 {
+		t.Fatalf("expected one sending record to be requeued, got %d", requeued)
+	}
+
+	if err := second.delivery.RecoverPending(context.Background()); err != nil {
+		t.Fatalf("RecoverPending() error = %v", err)
+	}
+
+	record, found, lookupErr := second.store.GetByEventID(context.Background(), "sending")
+	if lookupErr != nil {
+		t.Fatalf("GetByEventID() error = %v", lookupErr)
+	}
+	if !found {
+		t.Fatal("expected stored record")
+	}
+	if record.Status != store.StatusDelivered {
+		t.Fatalf("expected delivered after restart recovery, got %s", record.Status)
+	}
+	if client.Calls() != 1 {
+		t.Fatalf("expected one Telegram call, got %d", client.Calls())
+	}
+}
+
 func TestRotationDeletesOnlyTerminalRecords(t *testing.T) {
-	deps := newServiceDeps(t, fakeTelegramClient{})
+	deps := newServiceDeps(t, &fakeTelegramClient{})
 	deps.cfg.StoreRotationHighWatermark = 1
 	deps.cfg.StoreRotationLowWatermark = 1
 	deps.cfg.StoreRetentionDelivered = time.Hour
@@ -275,12 +372,16 @@ type serviceDeps struct {
 	client   *fakeTelegramClient
 }
 
-func newServiceDeps(t *testing.T, client fakeTelegramClient) *serviceDeps {
+func newServiceDeps(t *testing.T, client *fakeTelegramClient) *serviceDeps {
 	return newServiceDepsAtPath(t, filepath.Join(t.TempDir(), "store.db"), client)
 }
 
-func newServiceDepsAtPath(t *testing.T, dbPath string, client fakeTelegramClient) *serviceDeps {
+func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClient) *serviceDeps {
 	t.Helper()
+
+	if client == nil {
+		client = &fakeTelegramClient{}
+	}
 
 	templatePath := filepath.Join(t.TempDir(), "alert.tmpl")
 	if err := os.WriteFile(templatePath, []byte("<b>{{ .Status }}</b>{{ range .Alerts }} {{ .Name }} {{ .Summary }}{{ end }}"), 0o600); err != nil {
@@ -335,9 +436,7 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client fakeTelegramClient
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	clientCopy := client
-	clientPtr := &clientCopy
-	delivery := NewDeliveryService(cfg, sqliteStore, renderer, clientPtr, registry, logger)
+	delivery := NewDeliveryService(cfg, sqliteStore, renderer, client, registry, logger)
 	alerts := NewAlertService(sqliteStore, delivery, registry, logger)
 
 	return &serviceDeps{
@@ -346,7 +445,7 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client fakeTelegramClient
 		renderer: renderer,
 		delivery: delivery,
 		alerts:   alerts,
-		client:   clientPtr,
+		client:   client,
 	}
 }
 

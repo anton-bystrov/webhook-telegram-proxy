@@ -56,6 +56,39 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestReadyzEndpoint(t *testing.T) {
+	server := newHTTPTestServer(t)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+}
+
+func TestLivezEndpointBypassesBasicAuth(t *testing.T) {
+	server := newHTTPTestServerWithConfig(t, func(cfg *config.Config) {
+		cfg.BasicAuthUsername = "admin"
+		cfg.BasicAuthPassword = "very-secret-password"
+	})
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/livez")
+	if err != nil {
+		t.Fatalf("GET /livez error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	server := newHTTPTestServer(t)
 	defer server.Close()
@@ -141,6 +174,27 @@ func TestWebhookRejectsUnsupportedContentType(t *testing.T) {
 	}
 }
 
+func TestWebhookRejectsMissingContentType(t *testing.T) {
+	server := newHTTPTestServer(t)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/webhook/grafana", strings.NewReader(samplePayload))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("X-Webhook-Secret", "secret")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415 Unsupported Media Type, got %d", resp.StatusCode)
+	}
+}
+
 func TestBasicAuthProtectsRoutesWhenConfigured(t *testing.T) {
 	server := newHTTPTestServerWithConfig(t, func(cfg *config.Config) {
 		cfg.BasicAuthUsername = "admin"
@@ -162,7 +216,7 @@ func TestBasicAuthProtectsRoutesWhenConfigured(t *testing.T) {
 	}
 }
 
-func TestWebhookAcceptsValidBasicAuthAndSecret(t *testing.T) {
+func TestWebhookAcceptsSecretWithoutBasicAuth(t *testing.T) {
 	server := newHTTPTestServerWithConfig(t, func(cfg *config.Config) {
 		cfg.BasicAuthUsername = "admin"
 		cfg.BasicAuthPassword = "very-secret-password"
@@ -175,6 +229,31 @@ func TestWebhookAcceptsValidBasicAuthAndSecret(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Webhook-Secret", "secret")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+}
+
+func TestWebhookFallsBackToBasicAuthWhenSecretIsNotConfigured(t *testing.T) {
+	server := newHTTPTestServerWithConfig(t, func(cfg *config.Config) {
+		cfg.WebhookSecret = ""
+		cfg.BasicAuthUsername = "admin"
+		cfg.BasicAuthPassword = "very-secret-password"
+	})
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/webhook/grafana", strings.NewReader(samplePayload))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("admin:very-secret-password")))
 
 	resp, err := http.DefaultClient.Do(req)

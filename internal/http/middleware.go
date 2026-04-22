@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"time"
 	"unicode"
@@ -22,12 +23,30 @@ const requestIDKey contextKey = "request_id"
 
 type statusRecorder struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	wroteHeader bool
 }
 
 func (r *statusRecorder) WriteHeader(statusCode int) {
+	if r.wroteHeader {
+		return
+	}
 	r.statusCode = statusCode
+	r.wroteHeader = true
 	r.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (r *statusRecorder) Write(payload []byte) (int, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+	return r.ResponseWriter.Write(payload)
+}
+
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {
@@ -63,9 +82,15 @@ func basicAuthMiddleware(cfg config.Config, next http.Handler) http.Handler {
 	challenge := fmt.Sprintf(`Basic realm=%q, charset="UTF-8"`, cfg.BasicAuthRealm)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username, password, ok := r.BasicAuth()
-		if !ok || !secureCompare(username, cfg.BasicAuthUsername) || !secureCompare(password, cfg.BasicAuthPassword) {
+
+		// Evaluate both comparisons unconditionally so timing doesn't reveal
+		// which of username/password was wrong.
+		usernameOK := secureCompare(username, cfg.BasicAuthUsername)
+		passwordOK := secureCompare(password, cfg.BasicAuthPassword)
+
+		if !ok || !usernameOK || !passwordOK {
 			w.Header().Set("WWW-Authenticate", challenge)
-			writeError(w, r, http.StatusUnauthorized, "authentication required")
+			writePublicError(w, r, http.StatusUnauthorized, "authentication required")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -74,13 +99,22 @@ func basicAuthMiddleware(cfg config.Config, next http.Handler) http.Handler {
 
 func recoverMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				logger.Error("panic recovered", "request_id", requestIDFromContext(r.Context()), "panic", recovered)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+				logger.Error("panic recovered",
+					"request_id", requestIDFromContext(r.Context()),
+					"panic", recovered,
+					"stack", string(debug.Stack()),
+					"method", r.Method,
+					"path", r.URL.Path,
+				)
+				if !recorder.wroteHeader {
+					writePublicError(recorder, r, http.StatusInternalServerError, "internal server error")
+				}
 			}
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(recorder, r)
 	})
 }
 
@@ -121,15 +155,12 @@ func requestIDFromContext(ctx context.Context) string {
 func randomRequestID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
-		return "unknown"
+		return "rand-error"
 	}
 	return hex.EncodeToString(buf)
 }
 
 func secureCompare(actual, expected string) bool {
-	if actual == "" || expected == "" {
-		return false
-	}
 	actualHash := sha256.Sum256([]byte(actual))
 	expectedHash := sha256.Sum256([]byte(expected))
 	return subtle.ConstantTimeCompare(actualHash[:], expectedHash[:]) == 1
