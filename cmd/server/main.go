@@ -21,8 +21,9 @@ import (
 )
 
 var (
-	version  = "dev"
-	revision = "unknown"
+	version   = "dev"
+	revision  = "unknown"
+	buildDate = "unknown"
 )
 
 func main() {
@@ -83,7 +84,14 @@ func main() {
 	go deliveryService.Run(ctx)
 
 	go func() {
-		logger.Info("server started", "address", cfg.Address(), "environment", cfg.Environment, "version", version, "revision", revision)
+		logger.Info(
+			"server started",
+			"address", cfg.Address(),
+			"environment", cfg.Environment,
+			"version", version,
+			"revision", revision,
+			"build_date", buildDate,
+		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("http server stopped unexpectedly", "error", err)
 			stop()

@@ -1,0 +1,21 @@
+[Unit]
+Description=Grafana Telegram webhook proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/webhook-telegram-proxy/webhook-telegram-proxy.env
+WorkingDirectory=/var/lib/webhook-telegram-proxy
+ExecStart=/usr/bin/webhook-telegram-proxy --store-path /var/lib/webhook-telegram-proxy/webhook-telegram-proxy.db --alert-template-path /usr/share/webhook-telegram-proxy/templates/telegram_alert.tmpl
+Restart=on-failure
+RestartSec=5
+User=webhook-telegram-proxy
+Group=webhook-telegram-proxy
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
