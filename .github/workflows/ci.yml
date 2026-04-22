@@ -24,7 +24,7 @@ jobs:
 
       - name: Verify formatting
         run: |
-          test -z "$(/usr/local/go/bin/gofmt -l cmd internal)"
+          test -z "$(gofmt -l cmd internal)"
 
       - name: Run tests
         run: go test ./...

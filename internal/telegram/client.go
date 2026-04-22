@@ -9,20 +9,23 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"golang.org/x/net/proxy"
+
 	"github.com/anton-bystrov/webhook-telegram-proxy/internal/metrics"
 )
 
 // Default values for the HTTP transport. Tuned for a small service talking
-// exclusively to api.telegram.org: one host, steady low-to-medium RPS.
+// exclusively to the Telegram Bot API: one host, steady low-to-medium RPS.
 const (
 	defaultBaseURL             = "https://api.telegram.org"
 	defaultUserAgent           = "webhook-telegram-proxy"
-	defaultMaxResponseBytes    = 1 << 20 // 1 MiB — Telegram responses are <5 KB
+	defaultMaxResponseBytes    = 1 << 20 // 1 MiB — Telegram responses are normally tiny.
 	defaultDialTimeout         = 5 * time.Second
 	defaultKeepAlive           = 30 * time.Second
 	defaultTLSHandshakeTimeout = 10 * time.Second
@@ -44,8 +47,8 @@ type SentMessage struct {
 // APIError surfaces both transport-level and Telegram-level failures.
 //
 // For transport errors (DNS, TCP, TLS, timeout) StatusCode is 0 and
-// Description carries a redacted error message (token stripped). ErrorCode
-// is Telegram's own error_code when the body was parseable.
+// Description carries a redacted error message. ErrorCode is Telegram's own
+// error_code when the body was parseable.
 //
 // RetryAfter is populated from Telegram's parameters.retry_after or the
 // Retry-After HTTP header; it's zero when neither is present. The caller
@@ -67,17 +70,22 @@ func (e *APIError) Error() string {
 	)
 }
 
-// HTTPClient talks to the Telegram Bot API. The token is held only on this
-// struct — it's never placed into any error type. All errors that might
-// contain the token (via the full request URL in net/http's formatting)
-// pass through redactError before leaving this package.
+// HTTPClient talks to the Telegram Bot API.
 type HTTPClient struct {
-	baseURL   string
-	token     string
-	client    *http.Client
-	metrics   *metrics.Metrics
-	userAgent string
-	maxBody   int64
+	baseURL            string
+	token              string
+	client             *http.Client
+	metrics            *metrics.Metrics
+	userAgent          string
+	maxBody            int64
+	proxyURLRaw        string
+	customHTTPClient   bool
+	sensitiveReplacers []stringReplacer
+}
+
+type stringReplacer struct {
+	old string
+	new string
 }
 
 // Option configures an HTTPClient.
@@ -85,11 +93,19 @@ type Option func(*HTTPClient)
 
 // WithBaseURL overrides the Telegram API host. Use for tests, mocks, or
 // pointing at a self-hosted Bot API server.
-func WithBaseURL(url string) Option {
+func WithBaseURL(rawURL string) Option {
 	return func(c *HTTPClient) {
-		if url != "" {
-			c.baseURL = strings.TrimRight(url, "/")
+		if rawURL != "" {
+			c.baseURL = strings.TrimSpace(rawURL)
 		}
+	}
+}
+
+// WithProxyURL configures an explicit egress proxy for Telegram Bot API
+// requests. Supported schemes are http, https, and socks5.
+func WithProxyURL(rawURL string) Option {
+	return func(c *HTTPClient) {
+		c.proxyURLRaw = strings.TrimSpace(rawURL)
 	}
 }
 
@@ -99,12 +115,12 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *HTTPClient) {
 		if hc != nil {
 			c.client = hc
+			c.customHTTPClient = true
 		}
 	}
 }
 
-// WithUserAgent sets the User-Agent header. Include the service version so
-// Telegram ops can identify your traffic.
+// WithUserAgent sets the User-Agent header.
 func WithUserAgent(ua string) Option {
 	return func(c *HTTPClient) {
 		if ua != "" {
@@ -123,14 +139,9 @@ func WithMaxResponseBytes(n int64) Option {
 	}
 }
 
-// NewHTTPClient constructs a client. Token is required; panics (in test)
-// or returns an unusable client (in prod) are avoided — if token is empty
-// every SendMessage will fail fast with a non-retryable error.
-//
-// The supplied timeout is the total request deadline (connect + TLS + send
-// + receive). Callers may still pass a tighter ctx deadline; whichever
-// fires first wins.
-func NewHTTPClient(token string, timeout time.Duration, m *metrics.Metrics, opts ...Option) *HTTPClient {
+// NewHTTPClient constructs a client. The supplied timeout is the total request
+// deadline (connect + TLS + send + receive).
+func NewHTTPClient(token string, timeout time.Duration, m *metrics.Metrics, opts ...Option) (*HTTPClient, error) {
 	c := &HTTPClient{
 		baseURL:   defaultBaseURL,
 		token:     token,
@@ -139,27 +150,48 @@ func NewHTTPClient(token string, timeout time.Duration, m *metrics.Metrics, opts
 		maxBody:   defaultMaxResponseBytes,
 	}
 
-	// Default http.Client with a tuned Transport. If the caller supplies one
-	// via WithHTTPClient, it wins.
-	c.client = &http.Client{
-		Timeout:   timeout,
-		Transport: defaultTransport(),
-	}
-
 	for _, opt := range opts {
 		opt(c)
 	}
-	// Ensure the caller's timeout sticks even if they passed a custom client
-	// without setting it.
+
+	baseURL, err := normalizeBaseURL(c.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	c.baseURL = baseURL
+
+	proxyURL, err := parseProxyURL(c.proxyURLRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.customHTTPClient && proxyURL != nil {
+		return nil, errors.New("telegram proxy URL cannot be combined with a custom HTTP client")
+	}
+
+	if !c.customHTTPClient {
+		transport, err := newTransport(proxyURL)
+		if err != nil {
+			return nil, err
+		}
+		c.client = &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		}
+	}
+	if c.client == nil {
+		c.client = &http.Client{Timeout: timeout}
+	}
 	if c.client.Timeout == 0 && timeout > 0 {
 		c.client.Timeout = timeout
 	}
 
-	return c
+	c.sensitiveReplacers = buildSensitiveReplacers(c.token, proxyURL)
+	return c, nil
 }
 
-func defaultTransport() *http.Transport {
-	return &http.Transport{
+func newTransport(proxyURL *url.URL) (*http.Transport, error) {
+	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   defaultDialTimeout,
@@ -172,6 +204,136 @@ func defaultTransport() *http.Transport {
 		TLSHandshakeTimeout:   defaultTLSHandshakeTimeout,
 		ExpectContinueTimeout: defaultExpectContinue,
 	}
+
+	if proxyURL == nil {
+		return transport, nil
+	}
+
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(proxyURL)
+		return transport, nil
+	case "socks5":
+		dialer, err := proxy.FromURL(proxyURL, &net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: defaultKeepAlive,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("configure telegram socks5 proxy: %w", err)
+		}
+		transport.Proxy = nil
+		transport.DialContext = dialContextFromDialer(dialer)
+		return transport, nil
+	default:
+		return nil, fmt.Errorf("unsupported telegram proxy scheme %q", proxyURL.Scheme)
+	}
+}
+
+func dialContextFromDialer(dialer proxy.Dialer) func(ctx context.Context, network, address string) (net.Conn, error) {
+	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext
+	}
+
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		type result struct {
+			conn net.Conn
+			err  error
+		}
+
+		done := make(chan result, 1)
+		go func() {
+			conn, err := dialer.Dial(network, address)
+			done <- result{conn: conn, err: err}
+		}()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case result := <-done:
+			return result.conn, result.err
+		}
+	}
+}
+
+func normalizeBaseURL(rawURL string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", errors.New("telegram base URL must not be empty")
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse telegram base URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("telegram base URL scheme %q is not supported", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return "", errors.New("telegram base URL must include a host")
+	}
+	if parsed.User != nil {
+		return "", errors.New("telegram base URL must not contain credentials")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("telegram base URL must not contain query parameters or fragments")
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func parseProxyURL(rawURL string) (*url.URL, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, nil
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse telegram proxy URL: %w", err)
+	}
+	if parsed.Host == "" {
+		return nil, errors.New("telegram proxy URL must include a host")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("telegram proxy URL must not contain query parameters or fragments")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return nil, errors.New("telegram proxy URL must not contain a path")
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5":
+		return parsed, nil
+	case "mtproto":
+		return nil, errors.New("mtproto proxies are not supported for the HTTP Telegram Bot API client; use socks5/http(s), a local Bot API server, or network-level egress instead")
+	default:
+		return nil, fmt.Errorf("telegram proxy URL scheme %q is not supported", parsed.Scheme)
+	}
+}
+
+func buildSensitiveReplacers(token string, proxyURL *url.URL) []stringReplacer {
+	replacers := make([]stringReplacer, 0, 3)
+	if token != "" {
+		replacers = append(replacers, stringReplacer{old: token, new: "[REDACTED]"})
+	}
+	if proxyURL != nil && proxyURL.User != nil {
+		if userInfo := proxyURL.User.String(); userInfo != "" {
+			replacers = append(replacers, stringReplacer{old: userInfo + "@", new: "[REDACTED]@"})
+		}
+		sanitized := sanitizeURLForLog(proxyURL)
+		if sanitized != proxyURL.String() {
+			replacers = append(replacers, stringReplacer{old: proxyURL.String(), new: sanitized})
+		}
+	}
+	return replacers
+}
+
+func sanitizeURLForLog(rawURL *url.URL) string {
+	copyURL := *rawURL
+	copyURL.User = nil
+	copyURL.RawQuery = ""
+	copyURL.Fragment = ""
+	copyURL.Path = ""
+	return copyURL.String()
 }
 
 // sendMessageRequest is the typed body for POST /sendMessage. Using a struct
@@ -184,9 +346,7 @@ type sendMessageRequest struct {
 	DisableWebPagePreview bool   `json:"disable_web_page_preview"`
 }
 
-// sendMessageResponse models the Telegram envelope. Parameters carries the
-// retry_after on 429 and migrate_to_chat_id on chat upgrade; ErrorCode is
-// Telegram's own numeric code (usually equal to the HTTP status for errors).
+// sendMessageResponse models the Telegram envelope.
 type sendMessageResponse struct {
 	OK          bool   `json:"ok"`
 	Description string `json:"description"`
@@ -226,10 +386,8 @@ func (c *HTTPClient) SendMessage(ctx context.Context, chatID, text, parseMode st
 		return SentMessage{}, fmt.Errorf("marshal request: %w", err)
 	}
 
-	// Build URL once; token is only present here and is redacted from any
-	// error we ever return to the caller.
-	url := c.baseURL + "/bot" + c.token + "/sendMessage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	requestURL := c.baseURL + "/bot" + c.token + "/sendMessage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
 	if err != nil {
 		c.observe("send_message", "client_error", time.Since(start))
 		return SentMessage{}, c.redactError(err)
@@ -249,8 +407,6 @@ func (c *HTTPClient) SendMessage(ctx context.Context, chatID, text, parseMode st
 		}
 	}
 	defer func() {
-		// Drain before close so the connection can be reused from the pool
-		// even if we didn't read the whole body (e.g., body exceeded maxBody).
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
@@ -280,24 +436,16 @@ func (c *HTTPClient) SendMessage(ctx context.Context, chatID, text, parseMode st
 	var parsed sendMessageResponse
 	unmarshalErr := json.Unmarshal(responseBody, &parsed)
 
-	// If the HTTP status is 2xx but the Telegram envelope indicates an error,
-	// prefer the Telegram error code for classification and retry decisions.
 	statusCode := resp.StatusCode
 	if statusCode < 400 && !parsed.OK && parsed.ErrorCode != 0 {
 		statusCode = parsed.ErrorCode
 	}
 
-	// Build RetryAfter from whichever source speaks: Telegram's body field
-	// is the authoritative one on 429; fall back to the HTTP header for
-	// intermediary proxies that set it.
 	retryAfter := time.Duration(parsed.Parameters.RetryAfter) * time.Second
 	if retryAfter == 0 {
 		retryAfter = parseRetryAfterHeader(resp.Header.Get("Retry-After"))
 	}
 
-	// Non-2xx OR ok=false => error. This also covers the case where the body
-	// failed to parse (malformed JSON from an upstream proxy HTML page) but
-	// the status tells us it was a server-side failure.
 	if resp.StatusCode >= 400 || !parsed.OK || unmarshalErr != nil {
 		apiErr := c.buildAPIError(statusCode, parsed, unmarshalErr, retryAfter)
 		c.observe("send_message", resultLabelFor(statusCode, parsed.OK, unmarshalErr), time.Since(start))
@@ -311,8 +459,6 @@ func (c *HTTPClient) SendMessage(ctx context.Context, chatID, text, parseMode st
 	}, nil
 }
 
-// buildAPIError consolidates the error construction paths so body/parse
-// failures and HTTP errors produce consistent APIError values.
 func (c *HTTPClient) buildAPIError(statusCode int, parsed sendMessageResponse, unmarshalErr error, retryAfter time.Duration) *APIError {
 	description := strings.TrimSpace(parsed.Description)
 	if description == "" && unmarshalErr != nil {
@@ -325,8 +471,6 @@ func (c *HTTPClient) buildAPIError(statusCode int, parsed sendMessageResponse, u
 		description = "telegram error"
 	}
 
-	// Retryable: 429 always, 5xx always, decode failures on otherwise successful
-	// (2xx/3xx) responses. Client 4xx errors other than 429 are terminal.
 	retryable := false
 	switch {
 	case statusCode == http.StatusTooManyRequests:
@@ -346,7 +490,6 @@ func (c *HTTPClient) buildAPIError(statusCode int, parsed sendMessageResponse, u
 	}
 }
 
-// parseRetryAfterHeader handles both integer-seconds and HTTP-date forms.
 func parseRetryAfterHeader(h string) time.Duration {
 	if h == "" {
 		return 0
@@ -362,9 +505,6 @@ func parseRetryAfterHeader(h string) time.Duration {
 	return 0
 }
 
-// resultLabelFor maps a response into a metrics result label. Throttled gets
-// its own bucket so alerting can distinguish Telegram's "slow down" signal
-// from generic server-side errors.
 func resultLabelFor(statusCode int, ok bool, decodeErr error) string {
 	switch {
 	case statusCode == http.StatusTooManyRequests:
@@ -382,17 +522,11 @@ func resultLabelFor(statusCode int, ok bool, decodeErr error) string {
 	}
 }
 
-// classifyNetworkError decides whether a transport-level error is worth
-// retrying and returns a metric label. Timeouts and transient networking
-// issues are retryable; context cancellation from the caller (shutdown) is
-// not — delivery.go already handles that case separately, but we label it
-// so dashboards don't misattribute it as a Telegram outage.
 func classifyNetworkError(err error) (retryable bool, metricLabel string) {
 	if err == nil {
 		return false, "success"
 	}
 
-	// Caller-initiated cancel — not Telegram's fault.
 	if errors.Is(err, context.Canceled) {
 		return false, "canceled"
 	}
@@ -407,11 +541,9 @@ func classifyNetworkError(err error) (retryable bool, metricLabel string) {
 
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
-		// DNS failures are almost always transient (resolver blip, upstream hiccup).
 		return true, "dns"
 	}
 
-	// Connection-level errors: refused, reset, broken pipe.
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		return true, "network"
@@ -425,41 +557,35 @@ func classifyNetworkError(err error) (retryable bool, metricLabel string) {
 		}
 	}
 
-	// Unknown error classes: retry once, but label as unknown so operators
-	// notice if a new error class starts flaring.
 	return true, "unknown"
 }
 
-// redact strips the bot token from any string. net/http error formatting
-// includes the full request URL — which includes the token in the path —
-// so any error from http.Client.Do leaks the credential unless we scrub it.
 func (c *HTTPClient) redact(s string) string {
-	if c.token == "" || !strings.Contains(s, c.token) {
-		return s
+	for _, replacer := range c.sensitiveReplacers {
+		if replacer.old != "" && strings.Contains(s, replacer.old) {
+			s = strings.ReplaceAll(s, replacer.old, replacer.new)
+		}
 	}
-	return strings.ReplaceAll(s, c.token, "[REDACTED]")
+	return s
 }
 
-// redactError wraps an error so Error() returns a sanitized message while
-// preserving errors.Is / errors.As behavior on the original.
 func (c *HTTPClient) redactError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return &redactedError{err: err, token: c.token}
+	return &redactedError{err: err, redact: c.redact}
 }
 
 type redactedError struct {
-	err   error
-	token string
+	err    error
+	redact func(string) string
 }
 
 func (r *redactedError) Error() string {
-	msg := r.err.Error()
-	if r.token == "" {
-		return msg
+	if r.redact == nil {
+		return r.err.Error()
 	}
-	return strings.ReplaceAll(msg, r.token, "[REDACTED]")
+	return r.redact(r.err.Error())
 }
 
 func (r *redactedError) Unwrap() error { return r.err }

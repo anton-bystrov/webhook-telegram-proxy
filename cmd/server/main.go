@@ -66,7 +66,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	telegramClient := telegram.NewHTTPClient(cfg.TelegramBotToken, cfg.HTTPWriteTimeout, metricsRegistry)
+	telegramOptions := make([]telegram.Option, 0, 2)
+	if cfg.TelegramBaseURL != "" {
+		telegramOptions = append(telegramOptions, telegram.WithBaseURL(cfg.TelegramBaseURL))
+	}
+	if cfg.TelegramProxyURL != "" {
+		telegramOptions = append(telegramOptions, telegram.WithProxyURL(cfg.TelegramProxyURL))
+	}
+
+	telegramClient, err := telegram.NewHTTPClient(cfg.TelegramBotToken, cfg.HTTPWriteTimeout, metricsRegistry, telegramOptions...)
+	if err != nil {
+		logger.Error("initialize telegram client", "error", err)
+		os.Exit(1)
+	}
 	deliveryService := service.NewDeliveryService(cfg, sqliteStore, renderer, telegramClient, metricsRegistry, logger)
 	alertService := service.NewAlertService(sqliteStore, deliveryService, metricsRegistry, logger)
 
@@ -91,6 +103,8 @@ func main() {
 			"version", version,
 			"revision", revision,
 			"build_date", buildDate,
+			"telegram_proxy_enabled", cfg.TelegramProxyURL != "",
+			"telegram_base_url_custom", cfg.TelegramBaseURL != "",
 		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("http server stopped unexpectedly", "error", err)

@@ -73,6 +73,54 @@ func TestValidateRejectsNonPositiveHTTPTimeouts(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsTelegramProxyAndBaseURL(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_TEMPLATE_PATH", "templates/telegram_alert.tmpl")
+	t.Setenv("STORE_PATH", "data/test.db")
+
+	cfg, err := Parse([]string{
+		"--telegram-base-url", "https://botapi.internal.example",
+		"--telegram-proxy-url", "socks5://user:pass@proxy.internal.example:1080",
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if cfg.TelegramBaseURL != "https://botapi.internal.example" {
+		t.Fatalf("expected base URL from flags, got %q", cfg.TelegramBaseURL)
+	}
+	if cfg.TelegramProxyURL != "socks5://user:pass@proxy.internal.example:1080" {
+		t.Fatalf("expected proxy URL from flags, got %q", cfg.TelegramProxyURL)
+	}
+}
+
+func TestValidateRejectsUnsupportedTelegramProxyScheme(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_TEMPLATE_PATH", "templates/telegram_alert.tmpl")
+	t.Setenv("STORE_PATH", "data/test.db")
+	t.Setenv("TELEGRAM_PROXY_URL", "mtproto://proxy.example:443")
+
+	_, err := Parse([]string{})
+	if err == nil {
+		t.Fatal("expected validation error for unsupported telegram proxy scheme")
+	}
+}
+
+func TestValidateRejectsTelegramBaseURLWithCredentials(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_TEMPLATE_PATH", "templates/telegram_alert.tmpl")
+	t.Setenv("STORE_PATH", "data/test.db")
+	t.Setenv("TELEGRAM_BASE_URL", "https://user:pass@botapi.internal.example")
+
+	_, err := Parse([]string{})
+	if err == nil {
+		t.Fatal("expected validation error for telegram base URL with credentials")
+	}
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)

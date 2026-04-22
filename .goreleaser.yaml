@@ -79,7 +79,8 @@ archives:
           - zip
 
 checksum:
-  name_template: "checksums.txt"
+
+  name_template: checksums.txt
 
 snapshot:
   version_template: "{{ if .Version }}{{ .Version }}-snapshot{{ else }}0.0.0-snapshot{{ end }}"
