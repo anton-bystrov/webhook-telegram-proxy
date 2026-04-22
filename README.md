@@ -40,6 +40,8 @@ This is useful when you need more than a simple "receive JSON and call Telegram"
 - dedicated webhook protection through `X-Webhook-Secret`
 - safer HTTP defaults: request body limit, header size limit, security headers, constant-time secret comparison
 - bounded local store with watermark-based safe cleanup
+- versioned release pipeline for binaries, `.deb`, `.rpm`, and Docker images
+- `CHANGELOG.md` and tag-driven releases based on SemVer
 
 ## Delivery Model Limitations
 
@@ -63,6 +65,8 @@ For `v1`, a delivery is considered successful when Telegram Bot API returns `ok=
 
 - Go `1.22+` if you want to run the service as a binary
 - Docker if you want to run the container image
+- Docker Buildx if you want to build multi-platform images locally
+- GoReleaser if you want local snapshot packaging without GitHub Actions
 - access to the Telegram Bot API
 - Grafana with Unified Alerting webhook contact points
 - persistent storage for SQLite if you run the service in a container
@@ -170,7 +174,62 @@ The service has a few simple layers:
 - the template renderer loads the external template and injects alert data;
 - Prometheus metrics expose queue, retry, store, and Telegram API behavior.
 
+## Distribution and Release Assets
+
+Tagged releases publish versioned artifacts for:
+
+- Linux binaries: `amd64`, `arm64`, `armv7`
+- macOS binaries: `amd64`, `arm64`
+- Windows binary: `amd64`
+- Linux packages: `.deb` and `.rpm` for `amd64` and `arm64`
+- Multi-platform Docker image: `linux/amd64`, `linux/arm64`, `linux/arm/v7`
+
+Binary archives, packages, and checksums are attached to the GitHub Release.
+Container images are published to:
+
+```text
+ghcr.io/anton-bystrov/webhook-telegram-proxy
+```
+
+Version tags use Semantic Versioning:
+
+```text
+vX.Y.Z
+```
+
+Release notes come from GoReleaser git changelog generation, while `CHANGELOG.md`
+remains the human-readable project history.
+
 ## Running the Service
+
+### Local developer commands
+
+The repository includes a `Makefile` for the most common release and validation
+tasks:
+
+```bash
+make fmt
+make test
+make vet
+make build
+make changelog
+make release-check
+make snapshot
+make docker-build
+make docker-buildx
+```
+
+What these commands do:
+
+- `make build`: build the current-platform binary into `dist/`
+- `make snapshot`: build versioned archives plus `.deb` and `.rpm` packages into `dist/`
+- `make release-check`: validate `.goreleaser.yaml`
+- `make changelog`: generate a draft changelog file at `dist/CHANGELOG.next.md`
+- `make docker-build`: build a local Docker image with the standard Docker builder
+- `make docker-buildx`: build a multi-platform OCI image archive at `dist/`
+
+If `goreleaser` is not installed locally, the helper script falls back to
+running GoReleaser through Docker.
 
 ### Run as a regular binary
 
@@ -280,6 +339,85 @@ sudo systemctl start webhook-telegram-proxy
 ```bash
 sudo systemctl status webhook-telegram-proxy
 ```
+
+## Building Release Artifacts
+
+### Versioned binaries
+
+Snapshot builds use the current git state and embed:
+
+- `version`
+- `revision`
+- `buildDate`
+
+Release builds read the version from the git tag. Local development builds fall
+back to a version like:
+
+```text
+v0.1.0-dev.<shortsha>
+```
+
+To build the current platform binary:
+
+```bash
+make build
+```
+
+To build the full release matrix locally without publishing:
+
+```bash
+make snapshot
+```
+
+That produces archives and checksums under `dist/`.
+
+### `.deb` and `.rpm`
+
+`make snapshot` also produces Linux packages through GoReleaser + NFPM.
+
+The packages install:
+
+- the binary into `/usr/bin/webhook-telegram-proxy`
+- the packaged systemd unit into `/usr/lib/systemd/system/webhook-telegram-proxy.service`
+- the default Telegram template into `/usr/share/webhook-telegram-proxy/templates/telegram_alert.tmpl`
+- documentation assets into `/usr/share/doc/webhook-telegram-proxy/`
+
+Package post-install scripts create:
+
+- `/etc/webhook-telegram-proxy`
+- `/var/lib/webhook-telegram-proxy`
+- the system user `webhook-telegram-proxy`
+
+### Docker images
+
+Build a local single-platform image:
+
+```bash
+make docker-build
+```
+
+By default this target loads a `linux/amd64` image into the local Docker daemon.
+You can override it, for example:
+
+```bash
+docker build \
+  --build-arg VERSION=$(./scripts/version.sh) \
+  --build-arg REVISION=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+  -t webhook-telegram-proxy:dev .
+```
+
+Build a multi-platform OCI image archive locally:
+
+```bash
+make docker-buildx
+```
+
+The release workflow publishes Docker images for:
+
+- `linux/amd64`
+- `linux/arm64`
+- `linux/arm/v7`
 
 ## Configuration
 
@@ -748,6 +886,38 @@ Check the template syntax. The template is validated during startup and the proc
 
 If Basic Auth is enabled, Prometheus must scrape with valid credentials too.
 
+## Release Process
+
+Maintainers should use the following sequence for a production release:
+
+1. update `CHANGELOG.md`
+2. run:
+
+```bash
+make fmt
+make test
+make vet
+make changelog
+make release-check
+make snapshot
+```
+
+3. create and push a SemVer tag:
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+4. GitHub Actions will publish:
+   - binary archives
+   - checksums
+   - `.deb` and `.rpm` packages
+   - GitHub Release notes
+   - multi-platform Docker images
+
+The more detailed maintainer checklist lives in `docs/RELEASING.md`.
+
 ## Example Local Workflow
 
 ```bash
@@ -804,6 +974,10 @@ curl -u admin:very-strong-password http://127.0.0.1:8080/metrics
 - `internal/metrics` — Prometheus collectors
 - `templates/telegram_alert.tmpl` — default message template
 - `deploy/webhook-telegram-proxy.service` — example systemd unit
+- `.goreleaser.yaml` — release matrix for archives and Linux packages
+- `.github/workflows/` — CI and tagged release automation
+- `docs/RELEASING.md` — maintainer release checklist
+- `scripts/` — local helpers for versioning, changelog drafting, and GoReleaser execution
 
 ## What to Configure First
 
