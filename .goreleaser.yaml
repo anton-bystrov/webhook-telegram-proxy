@@ -79,6 +79,7 @@ archives:
           - zip
 
 checksum:
+
   name_template: checksums.txt
 
 snapshot:
