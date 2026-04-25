@@ -76,6 +76,37 @@ func TestAcceptWebhookSuccessfulDelivery(t *testing.T) {
 	}
 }
 
+func TestAcceptAlertmanagerWebhookSuccessfulDelivery(t *testing.T) {
+	deps := newServiceDeps(t, &fakeTelegramClient{
+		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 2, ChatID: -100123}}},
+	})
+
+	result, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(sampleAlertmanagerPayload))
+	if err != nil {
+		t.Fatalf("AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+	if result.EventID == "" || result.IdempotencyKey == "" {
+		t.Fatal("expected event id and idempotency key")
+	}
+
+	record, found, err := deps.store.GetByEventID(context.Background(), result.EventID)
+	if err != nil {
+		t.Fatalf("GetByEventID() error = %v", err)
+	}
+	if !found {
+		t.Fatal("expected stored record")
+	}
+	if record.Status != store.StatusDelivered {
+		t.Fatalf("expected delivered status, got %s", record.Status)
+	}
+	if deps.client.Calls() != 1 {
+		t.Fatalf("expected one Telegram call, got %d", deps.client.Calls())
+	}
+}
+
 func TestAcceptWebhookInvalidJSON(t *testing.T) {
 	deps := newServiceDeps(t, &fakeTelegramClient{})
 
@@ -484,4 +515,41 @@ const samplePayload = `{
   "title": "[FIRING:1] HighErrorRate",
   "state": "alerting",
   "message": "1 firing alert"
+}`
+
+const sampleAlertmanagerPayload = `{
+  "receiver": "telegram-webhook-proxy",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "MongoPrimaryDown",
+        "severity": "critical",
+        "instance": "mongodb-db-1"
+      },
+      "annotations": {
+        "summary": "Primary MongoDB instance is down",
+        "description": "mongodb-db-1 is unreachable"
+      },
+      "startsAt": "2026-04-22T18:22:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "https://alertmanager.example/#/alerts",
+      "fingerprint": "8c1fa7db"
+    }
+  ],
+  "groupLabels": {
+    "alertname": "MongoPrimaryDown"
+  },
+  "commonLabels": {
+    "severity": "critical",
+    "service": "mongodb"
+  },
+  "commonAnnotations": {
+    "summary": "Primary MongoDB instance is down"
+  },
+  "externalURL": "https://alertmanager.example",
+  "version": "4",
+  "groupKey": "{}:{alertname=\"MongoPrimaryDown\"}",
+  "truncatedAlerts": 0
 }`

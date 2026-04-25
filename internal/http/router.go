@@ -14,10 +14,10 @@ import (
 //
 // Auth topology:
 //
-//   - /webhook/grafana authenticates via X-Webhook-Secret when configured.
-//     If no webhook secret is set, it falls back to Basic Auth when enabled.
-//     This keeps the endpoint from becoming accidentally unauthenticated
-//     while still allowing Grafana to use the shared secret alone.
+//   - /webhook/grafana and /webhook/alertmanager accept either
+//     X-Webhook-Secret or Basic Auth when those mechanisms are configured.
+//     This keeps Grafana compatible with the shared-secret flow while also
+//     giving Alertmanager a practical in-cluster auth option.
 //
 //   - /health, /readyz, /metrics form the admin surface. Basic Auth guards
 //     them when configured. /livez is never behind auth so kubelet liveness
@@ -49,7 +49,11 @@ func NewRouter(
 
 	mux.Handle("POST /webhook/grafana",
 		handlers.withRoute("webhook_grafana",
-			http.HandlerFunc(handlers.webhookGrafana)))
+			http.HandlerFunc(handlers.webhookReceiver)))
+
+	mux.Handle("POST /webhook/alertmanager",
+		handlers.withRoute("webhook_alertmanager",
+			http.HandlerFunc(handlers.webhookReceiver)))
 
 	mux.Handle("GET /health",
 		handlers.withRoute("health",

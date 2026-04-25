@@ -36,7 +36,7 @@ This is useful when you need more than a simple "receive JSON and call Telegram"
 - deduplication of identical webhooks via fingerprinting
 - external Telegram message template via `templates/telegram_alert.tmpl`
 - automatic splitting of oversized Telegram messages
-- optional Basic Auth for admin endpoints and as a fallback for the webhook
+- optional Basic Auth for admin endpoints and webhook authentication
 - dedicated webhook protection through `X-Webhook-Secret`
 - safer HTTP defaults: request body limit, header size limit, security headers, constant-time secret comparison
 - bounded local store with watermark-based safe cleanup
@@ -330,7 +330,7 @@ Important notes:
 - mount `data` to persistent storage, otherwise the SQLite file is lost when the container is removed;
 - if Basic Auth is enabled, it protects `GET /health`, `GET /readyz`, and `GET /metrics`;
 - `GET /livez` is intentionally unauthenticated for liveness probes;
-- `POST /webhook/grafana` uses `X-Webhook-Secret` when configured, and falls back to Basic Auth only when the webhook secret is not set.
+- webhook endpoints accept either `X-Webhook-Secret` or Basic Auth when those mechanisms are configured.
 
 ### Run as a systemd service
 
@@ -676,8 +676,7 @@ Request requirements:
 
 - method: `POST`
 - `Content-Type: application/json`
-- `X-Webhook-Secret` header if `WEBHOOK_SECRET` is configured
-- Basic Auth only if `WEBHOOK_SECRET` is not configured and Basic Auth is enabled
+- either `X-Webhook-Secret` or Basic Auth when those mechanisms are configured
 
 Example successful response:
 
@@ -695,7 +694,7 @@ Possible response codes:
 - `200 OK`: delivered successfully, duplicate of an already known event, or terminally finished with `failed` / `dead_letter`
 - `202 Accepted`: duplicate of an event that is still being worked on or has been requeued
 - `400 Bad Request`: invalid JSON
-- `401 Unauthorized`: invalid `X-Webhook-Secret`, or invalid Basic Auth credentials when running in Basic Auth fallback mode
+- `401 Unauthorized`: invalid `X-Webhook-Secret` or invalid Basic Auth credentials
 - `413 Payload Too Large`: request body exceeds the configured limit
 - `415 Unsupported Media Type`: `Content-Type` is not `application/json`
 - `502 Bad Gateway`: Telegram or the network path to Telegram is temporarily unavailable, delivery will be retried
@@ -710,6 +709,24 @@ Example error response:
   "request_id": "e7b3dfe4f9e547f5"
 }
 ```
+
+### `POST /webhook/alertmanager`
+
+Purpose: accept an Alertmanager webhook, persist it, try to deliver it to Telegram, and return the processing status.
+
+Request requirements:
+
+- method: `POST`
+- `Content-Type: application/json`
+- either `X-Webhook-Secret` or Basic Auth when those mechanisms are configured
+
+Typical in-cluster URL:
+
+```text
+http://webhook-telegram-proxy.monitoring.svc.cluster.local:8080/webhook/alertmanager
+```
+
+Response semantics are the same as for `POST /webhook/grafana`.
 
 ### `GET /health`
 

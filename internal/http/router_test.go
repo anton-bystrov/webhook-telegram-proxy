@@ -267,6 +267,53 @@ func TestWebhookFallsBackToBasicAuthWhenSecretIsNotConfigured(t *testing.T) {
 	}
 }
 
+func TestWebhookAcceptsBasicAuthWhenSecretIsAlsoConfigured(t *testing.T) {
+	server := newHTTPTestServerWithConfig(t, func(cfg *config.Config) {
+		cfg.BasicAuthUsername = "admin"
+		cfg.BasicAuthPassword = "very-secret-password"
+	})
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/webhook/alertmanager", strings.NewReader(sampleAlertmanagerPayload))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("admin:very-secret-password")))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+}
+
+func TestAlertmanagerWebhookAcceptsSecret(t *testing.T) {
+	server := newHTTPTestServer(t)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/webhook/alertmanager", strings.NewReader(sampleAlertmanagerPayload))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Webhook-Secret", "secret")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+}
+
 func newHTTPTestServer(t *testing.T) *httptest.Server {
 	return newHTTPTestServerWithConfig(t, nil)
 }
@@ -354,4 +401,41 @@ const samplePayload = `{
       "startsAt": "2026-04-21T18:22:00Z"
     }
   ]
+}`
+
+const sampleAlertmanagerPayload = `{
+  "receiver": "telegram-webhook-proxy",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "MongoPrimaryDown",
+        "severity": "critical",
+        "instance": "mongodb-db-1"
+      },
+      "annotations": {
+        "summary": "Primary MongoDB instance is down",
+        "description": "mongodb-db-1 is unreachable"
+      },
+      "startsAt": "2026-04-22T18:22:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "https://prometheus.example/graph",
+      "fingerprint": "8c1fa7db"
+    }
+  ],
+  "groupLabels": {
+    "alertname": "MongoPrimaryDown"
+  },
+  "commonLabels": {
+    "severity": "critical",
+    "service": "mongodb"
+  },
+  "commonAnnotations": {
+    "summary": "Primary MongoDB instance is down"
+  },
+  "externalURL": "https://alertmanager.example",
+  "version": "4",
+  "groupKey": "{}:{alertname=\"MongoPrimaryDown\"}",
+  "truncatedAlerts": 0
 }`
