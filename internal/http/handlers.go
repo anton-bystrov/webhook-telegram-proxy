@@ -43,28 +43,11 @@ type errorResponse struct {
 	RequestID string `json:"request_id,omitempty"`
 }
 
-func (h *Handlers) webhookGrafana(w http.ResponseWriter, r *http.Request) {
-	// Webhook authentication:
-	// 1. If WEBHOOK_SECRET is configured, the request must present it.
-	// 2. If no webhook secret exists, fall back to Basic Auth when enabled.
-	// 3. If neither auth layer is configured, the endpoint remains open for
-	//    compatibility with the current service contract.
-	switch {
-	case h.cfg.WebhookSecret != "":
-		if !secureCompare(r.Header.Get("X-Webhook-Secret"), h.cfg.WebhookSecret) {
-			h.metrics.WebhookEventsReceivedTotal.WithLabelValues("unauthorized").Inc()
-			writePublicError(w, r, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-	case h.cfg.BasicAuthEnabled():
-		username, password, ok := r.BasicAuth()
-		usernameOK := secureCompare(username, h.cfg.BasicAuthUsername)
-		passwordOK := secureCompare(password, h.cfg.BasicAuthPassword)
-		if !ok || !usernameOK || !passwordOK {
-			h.metrics.WebhookEventsReceivedTotal.WithLabelValues("unauthorized").Inc()
-			writePublicError(w, r, http.StatusUnauthorized, "unauthorized")
-			return
-		}
+func (h *Handlers) webhookReceiver(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizeWebhook(r) {
+		h.metrics.WebhookEventsReceivedTotal.WithLabelValues("unauthorized").Inc()
+		writePublicError(w, r, http.StatusUnauthorized, "unauthorized")
+		return
 	}
 
 	if err := requireJSONContentType(r); err != nil {
@@ -105,6 +88,23 @@ func (h *Handlers) webhookGrafana(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, r, statusCode, result)
+}
+
+func (h *Handlers) authorizeWebhook(r *http.Request) bool {
+	if h.cfg.WebhookSecret != "" && secureCompare(r.Header.Get("X-Webhook-Secret"), h.cfg.WebhookSecret) {
+		return true
+	}
+
+	if h.cfg.BasicAuthEnabled() {
+		username, password, ok := r.BasicAuth()
+		usernameOK := secureCompare(username, h.cfg.BasicAuthUsername)
+		passwordOK := secureCompare(password, h.cfg.BasicAuthPassword)
+		if ok && usernameOK && passwordOK {
+			return true
+		}
+	}
+
+	return h.cfg.WebhookSecret == "" && !h.cfg.BasicAuthEnabled()
 }
 
 func (h *Handlers) health(w http.ResponseWriter, r *http.Request) {
