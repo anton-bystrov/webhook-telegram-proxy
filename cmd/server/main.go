@@ -60,10 +60,13 @@ func main() {
 		}
 	}()
 
-	renderer, err := alerttemplate.Load(cfg.AlertTemplatePath, metricsRegistry)
-	if err != nil {
-		logger.Error("load alert template", "error", err)
-		os.Exit(1)
+	var renderer *alerttemplate.Renderer
+	if cfg.UsesTemplateRenderer() {
+		renderer, err = alerttemplate.Load(cfg.AlertTemplatePath, metricsRegistry)
+		if err != nil {
+			logger.Error("load alert template", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	telegramOptions := make([]telegram.Option, 0, 2)
@@ -103,6 +106,7 @@ func main() {
 			"version", version,
 			"revision", revision,
 			"build_date", buildDate,
+			"alert_message_source", cfg.AlertMessageSource,
 			"telegram_proxy_enabled", cfg.TelegramProxyURL != "",
 			"telegram_base_url_custom", cfg.TelegramBaseURL != "",
 		)

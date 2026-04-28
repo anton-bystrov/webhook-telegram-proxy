@@ -95,6 +95,38 @@ func TestParseAcceptsTelegramProxyAndBaseURL(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsAlertmanagerMessageSourceWithoutTemplatePath(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_MESSAGE_SOURCE", "alertmanager")
+	t.Setenv("ALERT_TEMPLATE_PATH", "")
+	t.Setenv("STORE_PATH", "data/test.db")
+
+	cfg, err := Parse([]string{})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.AlertMessageSource != "alertmanager" {
+		t.Fatalf("expected alertmanager message source, got %q", cfg.AlertMessageSource)
+	}
+	if cfg.UsesTemplateRenderer() {
+		t.Fatal("expected alertmanager mode to skip template renderer")
+	}
+}
+
+func TestValidateRejectsUnsupportedAlertMessageSource(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_MESSAGE_SOURCE", "custom")
+	t.Setenv("ALERT_TEMPLATE_PATH", "templates/telegram_alert.tmpl")
+	t.Setenv("STORE_PATH", "data/test.db")
+
+	_, err := Parse([]string{})
+	if err == nil {
+		t.Fatal("expected validation error for unsupported alert message source")
+	}
+}
+
 func TestValidateRejectsUnsupportedTelegramProxyScheme(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
 	t.Setenv("TELEGRAM_CHAT_ID", "chat")

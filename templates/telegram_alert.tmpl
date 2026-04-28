@@ -1,63 +1,79 @@
+{{- /* ─────────────────────────────────────────────────────────────
+   Alert template
+   ───────────────────────────────────────────────────────────── */ -}}
+
 {{- if gt .PartCount 1 -}}
-<b>Grafana alert batch {{ .PartIndex }}/{{ .PartCount }}</b>
+<b>📦 Part {{ .PartIndex }} of {{ .PartCount }}</b>
 
 {{ end -}}
-<b>Status:</b> {{ orDash .Status }}
-<b>Receiver:</b> {{ orDash .Receiver }}
-<b>Alerts:</b> {{ .TotalAlerts }} (firing={{ .FiringCount }}, resolved={{ .ResolvedCount }})
-<b>Group key:</b> {{ orDash .GroupKey }}
-{{- if .Title }}
-<b>Title:</b> {{ .Title }}
+
+{{- /* ── Header: status · environment · counts ── */ -}}
+{{- $envName := env .CommonLabels -}}
+{{ statusIcon .Status }}{{ if $envName }} {{ envIcon $envName }} <b>{{ upper $envName }}</b>{{ end }}
+{{ .FiringCount }} firing{{ if .ResolvedCount }} · {{ .ResolvedCount }} resolved{{ end }}{{ if .TotalAlerts }} · {{ .TotalAlerts }} total{{ end }}
+
+{{- /* ── Group context (only labels shared by every alert) ── */ -}}
+{{- with filterLabels .CommonLabels }}
+<i>{{ joinPairs . }}</i>
 {{- end }}
 {{- if .Message }}
-<b>Message:</b> {{ .Message }}
-{{- end }}
-{{- if .ExternalURL }}
-<b>Source:</b> {{ .ExternalURL }}
-{{- end }}
-{{- if .CommonLabels }}
-<b>Common labels:</b> {{ joinPairs .CommonLabels }}
-{{- end }}
-{{- if .CommonAnnotations }}
-<b>Common annotations:</b> {{ joinPairs .CommonAnnotations }}
+
+{{ .Message }}
 {{- end }}
 
-{{- range .Alerts }}
-<b>Alert:</b> {{ orDash .Name }}
-<b>Severity:</b> {{ orDash .Severity }}
-<b>Alert status:</b> {{ orDash .Status }}
-{{- if .Summary }}
-<b>Summary:</b> {{ .Summary }}
-{{- end }}
-{{- if .Description }}
-<b>Description:</b> {{ .Description }}
-{{- end }}
-{{- if .StartsAt }}
-<b>Starts at:</b> {{ .StartsAt }}
-{{- end }}
-{{- if .EndsAt }}
-<b>Ends at:</b> {{ .EndsAt }}
-{{- end }}
-{{- if .GeneratorURL }}
-<b>Generator URL:</b> {{ .GeneratorURL }}
-{{- end }}
-{{- if .DashboardURL }}
-<b>Dashboard URL:</b> {{ .DashboardURL }}
-{{- end }}
-{{- if .PanelURL }}
-<b>Panel URL:</b> {{ .PanelURL }}
-{{- end }}
-{{- if .SilenceURL }}
-<b>Silence URL:</b> {{ .SilenceURL }}
-{{- end }}
-{{- if .ValueString }}
-<b>Values:</b> {{ .ValueString }}
-{{- end }}
-{{- if .Labels }}
-<b>Labels:</b> {{ joinPairs .Labels }}
-{{- end }}
-{{- if .Annotations }}
-<b>Annotations:</b> {{ joinPairs .Annotations }}
+{{- /* ── Per-alert blocks ─────────────────────────────────── */ -}}
+{{ range $i, $a := .Alerts }}
+─────────────────────────────
+{{ severityIcon $a.Severity }} <b>{{ orDash $a.Name }}</b>
+{{- if $a.Severity }} · {{ $a.Severity }}{{ end -}}
+{{- if eq $a.Status "resolved" }} · ✅ resolved{{ end }}
+
+{{- /* Summary first — the headline for humans */ -}}
+{{- if $a.Summary }}
+{{ $a.Summary }}
 {{- end }}
 
+{{- /* Description only if it actually adds info */ -}}
+{{- if and $a.Description (ne $a.Description $a.Summary) }}
+
+{{ truncate $a.Description 500 }}
+{{- end }}
+
+{{- /* Identity: where exactly is this happening */ -}}
+{{- $where := filterLabels $a.Labels }}
+{{- if $where }}
+
+<b>Where:</b> <b>{{ joinPairs $where }}</b>
+{{- end }}
+
+{{- /* Value: actual measurement that triggered the rule */ -}}
+{{- if $a.ValueString }}
+<b>Value:</b> <b><code>{{ $a.ValueString }}</code></b>
+{{- end }}
+
+{{- /* Time: when it started, how long it's been going */ -}}
+{{- if not (isZeroTime $a.StartsAt) }}
+<b>Since:</b> <b>{{ formatTime $a.StartsAt }} ({{ since $a.StartsAt }})</b>
+{{- end }}
+{{- if and (eq $a.Status "resolved") (not (isZeroTime $a.EndsAt)) }}
+<b>Resolved:</b> {{ formatTime $a.EndsAt }} (lasted {{ duration $a.StartsAt $a.EndsAt }})
+{{- end }}
+
+{{- /* Actionable links: only those that exist, on one line */ -}}
+{{- $links := list -}}
+{{- if index $a.Annotations "runbook_url" }}{{ $links = append $links (printf "<a href=\"%s\">📕 runbook</a>" (index $a.Annotations "runbook_url")) }}{{ end -}}
+{{- if $a.GeneratorURL }}{{ $links = append $links (printf "<a href=\"%s\">📊 graph</a>" $a.GeneratorURL) }}{{ end -}}
+{{- if $a.DashboardURL }}{{ $links = append $links (printf "<a href=\"%s\">📈 dashboard</a>" $a.DashboardURL) }}{{ end -}}
+{{- if $a.PanelURL }}{{ $links = append $links (printf "<a href=\"%s\">🔍 panel</a>" $a.PanelURL) }}{{ end -}}
+{{- if $a.SilenceURL }}{{ $links = append $links (printf "<a href=\"%s\">🔕 silence</a>" $a.SilenceURL) }}{{ end -}}
+{{- if $links }}
+
+{{ join $links "  ·  " }}
+{{- end }}
+{{- end }}
+
+{{- /* ── Footer: only if alerts were truncated ────────────── */ -}}
+{{- if gt .TotalAlerts (len .Alerts) }}
+
+<i>… and {{ sub .TotalAlerts (len .Alerts) }} more alerts in this group</i>
 {{- end }}
