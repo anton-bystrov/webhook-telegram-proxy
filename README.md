@@ -1,6 +1,6 @@
 # webhook-telegram-proxy
 
-`webhook-telegram-proxy` receives Grafana Unified Alerting webhooks, stores them in a local SQLite database, renders a message from an external template, and sends that message to a Telegram channel or chat.
+`webhook-telegram-proxy` receives Grafana Unified Alerting or Alertmanager webhooks, stores them in a local SQLite database, builds a Telegram message either from an external template or from Alertmanager-prepared text, and sends that message to a Telegram channel or chat.
 
 The project is designed not only to "forward an alert quickly", but to behave predictably in production:
 
@@ -19,7 +19,7 @@ Grafana can send alerts to an arbitrary HTTP endpoint via webhook. This project 
 1. Grafana sends a webhook to `POST /webhook/grafana`.
 2. The service validates authentication and request shape.
 3. The event is written to SQLite.
-4. A Telegram message is rendered from the webhook payload using a template.
+4. A Telegram message is built either from the local template or from Alertmanager-prepared text.
 5. The message is sent through the Telegram Bot API.
 6. If Telegram is temporarily unavailable, the event stays in the local queue and is retried later.
 
@@ -34,6 +34,7 @@ This is useful when you need more than a simple "receive JSON and call Telegram"
 - persistent SQLite-backed outbox
 - `at-least-once` delivery with retry and restart recovery
 - deduplication of identical webhooks via fingerprinting
+- two message modes: local template rendering or Alertmanager-prepared text passthrough
 - external Telegram message template via `templates/telegram_alert.tmpl`
 - automatic splitting of oversized Telegram messages
 - optional Basic Auth for admin endpoints and webhook authentication
@@ -484,6 +485,7 @@ The main settings are listed below. See `.env.example` for a complete example.
 | `APP_PORT` | `--app-port` | `8080` | HTTP bind port |
 | `LOG_LEVEL` | `--log-level` | `INFO` | Log level |
 | `ENVIRONMENT` | `--environment` | `production` | Environment name |
+| `ALERT_MESSAGE_SOURCE` | `--alert-message-source` | `template` | Message source: `template` or `alertmanager` |
 | `ALERT_TEMPLATE_PATH` | `--alert-template-path` | `templates/telegram_alert.tmpl` | Path to the message template |
 | `MESSAGE_PARSE_MODE` | `--message-parse-mode` | `HTML` | Only `HTML` is supported in `v1` |
 
@@ -823,6 +825,17 @@ If the store grows beyond safe limits and cleanup cannot free enough space, the 
 
 ## Telegram Message Template
 
+`ALERT_MESSAGE_SOURCE` controls how Telegram text is built:
+
+- `template` keeps the existing local rendering flow
+- `alertmanager` skips the local template and forwards the top-level webhook `message` as-is
+
+In `alertmanager` mode the service does not load `ALERT_TEMPLATE_PATH` during startup.
+If the webhook has an empty `message`, the service falls back to `title`.
+If both values are empty, delivery is marked as a terminal failure and is not retried forever.
+
+This mode is intended for Alertmanager setups where the final Telegram-friendly text is already produced by Alertmanager templates. The forwarded text must therefore already be valid for Telegram `HTML` parse mode.
+
 Message formatting lives in a separate file:
 
 ```text
@@ -831,7 +844,7 @@ templates/telegram_alert.tmpl
 
 You can change the path through `ALERT_TEMPLATE_PATH` or `--alert-template-path`.
 
-The template is loaded during startup. If the file is missing or contains invalid syntax, the service will fail to start.
+The template is loaded during startup only when `ALERT_MESSAGE_SOURCE=template`. If the file is missing or contains invalid syntax in template mode, the service will fail to start.
 
 ### Template behavior
 
@@ -855,10 +868,10 @@ The template receives a `MessageData` structure with these fields:
 | `Message` | top-level notification message |
 | `FiringCount` | number of firing alerts |
 | `ResolvedCount` | number of resolved alerts |
-| `TotalAlerts` | number of alerts in the current rendered part |
+| `TotalAlerts` | alerts represented by the current rendered part, including source-side truncation |
 | `TruncatedAlerts` | truncated alert count from payload |
-| `CommonLabels` | common labels |
-| `CommonAnnotations` | common annotations |
+| `CommonLabels` | common labels as `map[string]string` |
+| `CommonAnnotations` | common annotations as `map[string]string` |
 | `Alerts` | list of individual alerts |
 | `PartIndex` | current message part number |
 | `PartCount` | total number of parts |
@@ -872,34 +885,48 @@ The template receives a `MessageData` structure with these fields:
 | `Severity` | severity |
 | `Summary` | summary |
 | `Description` | description |
-| `StartsAt` | start time |
-| `EndsAt` | end time |
+| `StartsAt` | start time as `time.Time` |
+| `EndsAt` | end time as `time.Time` |
 | `GeneratorURL` | alert URL |
 | `SilenceURL` | silence URL |
 | `DashboardURL` | dashboard URL |
 | `PanelURL` | panel URL |
 | `ValueString` | value string |
-| `Labels` | labels as key/value pairs |
-| `Annotations` | annotations as key/value pairs |
+| `Labels` | labels as `map[string]string` |
+| `Annotations` | annotations as `map[string]string` |
 
 ### Template helper functions
 
 | Function | Description |
 | --- | --- |
-| `orDash` | replaces an empty value with `-` |
-| `joinPairs` | turns key/value pairs into `key=value, key2=value2` |
+| `append` | appends a string to a string slice |
+| `duration` | returns a compact duration between two timestamps |
+| `env` | infers `prod`, `staging`, or `dev` from common labels |
+| `envIcon` | returns an environment icon |
+| `filterLabels` | removes noisy labels like `alertname` and `severity` |
+| `formatTime` | formats a timestamp as `2006-01-02 15:04 MST` |
+| `join` | joins a string slice with a separator |
+| `joinPairs` | turns labels or annotations into `key=value, key2=value2` |
+| `list` | creates a string slice in the template |
+| `orDash` | replaces an empty value with `—` |
+| `pickFirst` | returns the first non-empty key from a label or annotation map |
+| `severityIcon` | returns an icon for `critical`, `warning`, or `info` |
+| `since` | returns a compact relative age like `12m ago` |
+| `statusIcon` | returns an icon for `firing` or `resolved` |
+| `sub` | subtracts one integer from another |
+| `truncate` | truncates a string and appends `…` |
+| `upper` | uppercases a string |
 
 ### Example template fragment
 
 ```gotemplate
-<b>Status:</b> {{ orDash .Status }}
-<b>Receiver:</b> {{ orDash .Receiver }}
-<b>Alerts:</b> {{ .TotalAlerts }} (firing={{ .FiringCount }}, resolved={{ .ResolvedCount }})
+{{- $envName := env .CommonLabels -}}
+{{ statusIcon .Status }}{{ if $envName }} {{ envIcon $envName }} <b>{{ upper $envName }}</b>{{ end }}
+{{ .FiringCount }} firing{{ if .ResolvedCount }} · {{ .ResolvedCount }} resolved{{ end }}{{ if .TotalAlerts }} · {{ .TotalAlerts }} total{{ end }}
 {{- range .Alerts }}
-<b>Alert:</b> {{ orDash .Name }}
-<b>Severity:</b> {{ orDash .Severity }}
+{{ severityIcon .Severity }} <b>{{ orDash .Name }}</b>
 {{- if .Summary }}
-<b>Summary:</b> {{ .Summary }}
+{{ .Summary }}
 {{- end }}
 {{- end }}
 ```
@@ -956,7 +983,7 @@ Operationally, the most useful things to watch are:
    - rising dead-letter count;
    - `store_disk_pressure=1`;
    - unhealthy health status.
-6. Change message format through `ALERT_TEMPLATE_PATH` instead of modifying code.
+6. Choose `ALERT_MESSAGE_SOURCE=template` if the service should format messages itself, or `ALERT_MESSAGE_SOURCE=alertmanager` if Alertmanager already produces the final Telegram text.
 
 ## Troubleshooting
 
@@ -999,7 +1026,16 @@ Check:
 
 ### The service does not start after editing the template
 
-Check the template syntax. The template is validated during startup and the process exits immediately on parse errors.
+Check the template syntax. In `ALERT_MESSAGE_SOURCE=template`, the template is validated during startup and the process exits immediately on parse errors.
+
+### Alertmanager mode accepts the webhook but nothing is delivered
+
+Check:
+
+- whether `ALERT_MESSAGE_SOURCE=alertmanager` is really set;
+- whether the webhook payload includes a non-empty top-level `message` or `title`;
+- whether the prepared message is valid Telegram `HTML`;
+- stored delivery status for `failed` records with message-construction errors.
 
 ### Metrics are unavailable
 

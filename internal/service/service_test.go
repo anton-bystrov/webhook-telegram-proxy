@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +22,7 @@ import (
 type fakeTelegramClient struct {
 	mu        sync.Mutex
 	callCount int
+	texts     []string
 	responses []fakeTelegramResult
 }
 
@@ -33,6 +36,7 @@ func (f *fakeTelegramClient) SendMessage(ctx context.Context, chatID, text, pars
 	defer f.mu.Unlock()
 	index := f.callCount
 	f.callCount++
+	f.texts = append(f.texts, text)
 	if index >= len(f.responses) {
 		return telegram.SentMessage{MessageID: int64(index + 1), ChatID: -100123}, nil
 	}
@@ -43,6 +47,14 @@ func (f *fakeTelegramClient) Calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.callCount
+}
+
+func (f *fakeTelegramClient) Texts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.texts))
+	copy(out, f.texts)
+	return out
 }
 
 func TestAcceptWebhookSuccessfulDelivery(t *testing.T) {
@@ -246,7 +258,7 @@ func TestRecoveryProcessesPendingAfterRestart(t *testing.T) {
 			err: &telegram.APIError{StatusCode: 500, Description: "temporary", Retryable: true},
 		}},
 	}
-	first := newServiceDepsAtPath(t, dbPath, firstClient)
+	first := newServiceDepsAtPath(t, dbPath, firstClient, nil)
 	first.cfg.RetryBaseDelay = time.Millisecond
 	first.delivery.cfg.RetryBaseDelay = time.Millisecond
 
@@ -262,7 +274,7 @@ func TestRecoveryProcessesPendingAfterRestart(t *testing.T) {
 	secondClient := &fakeTelegramClient{
 		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 22, ChatID: -100123}}},
 	}
-	second := newServiceDepsAtPath(t, dbPath, secondClient)
+	second := newServiceDepsAtPath(t, dbPath, secondClient, nil)
 	time.Sleep(5 * time.Millisecond)
 	if err := second.delivery.RecoverPending(context.Background()); err != nil {
 		t.Fatalf("RecoverPending() error = %v", err)
@@ -284,7 +296,7 @@ func TestRestartRequeuesSendingRecords(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "store.db")
 
-	first := newServiceDepsAtPath(t, dbPath, &fakeTelegramClient{})
+	first := newServiceDepsAtPath(t, dbPath, &fakeTelegramClient{}, nil)
 
 	old := time.Now().Add(-time.Hour).UTC()
 	lastAttempt := old
@@ -307,7 +319,7 @@ func TestRestartRequeuesSendingRecords(t *testing.T) {
 	client := &fakeTelegramClient{
 		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 33, ChatID: -100123}}},
 	}
-	second := newServiceDepsAtPath(t, dbPath, client)
+	second := newServiceDepsAtPath(t, dbPath, client, nil)
 
 	requeued, err := second.store.RequeueSending(context.Background(), time.Now().UTC())
 	if err != nil {
@@ -404,10 +416,10 @@ type serviceDeps struct {
 }
 
 func newServiceDeps(t *testing.T, client *fakeTelegramClient) *serviceDeps {
-	return newServiceDepsAtPath(t, filepath.Join(t.TempDir(), "store.db"), client)
+	return newServiceDepsAtPath(t, filepath.Join(t.TempDir(), "store.db"), client, nil)
 }
 
-func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClient) *serviceDeps {
+func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClient, mutate func(*config.Config)) *serviceDeps {
 	t.Helper()
 
 	if client == nil {
@@ -426,6 +438,7 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClien
 		Environment:                "test",
 		TelegramBotToken:           "test-token",
 		TelegramChatID:             "-100123",
+		AlertMessageSource:         "template",
 		AlertTemplatePath:          templatePath,
 		MessageParseMode:           "HTML",
 		HTTPReadTimeout:            time.Second,
@@ -448,6 +461,9 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClien
 		StoreRetentionDeadLetter:   time.Hour,
 		StoreRotationInterval:      time.Second,
 	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
 
 	registry, err := metrics.New("test", "test")
 	if err != nil {
@@ -462,9 +478,12 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClien
 		_ = sqliteStore.Close()
 	})
 
-	renderer, err := alerttemplate.Load(templatePath, registry)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+	var renderer *alerttemplate.Renderer
+	if cfg.UsesTemplateRenderer() {
+		renderer, err = alerttemplate.Load(templatePath, registry)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
 	}
 
 	delivery := NewDeliveryService(cfg, sqliteStore, renderer, client, registry, logger)
@@ -477,6 +496,156 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClien
 		delivery: delivery,
 		alerts:   alerts,
 		client:   client,
+	}
+}
+
+func TestAcceptAlertmanagerMessageSourceUsesPreparedMessage(t *testing.T) {
+	deps := newServiceDepsAtPath(t, filepath.Join(t.TempDir(), "store.db"), &fakeTelegramClient{
+		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 3, ChatID: -100123}}},
+	}, func(cfg *config.Config) {
+		cfg.AlertMessageSource = "alertmanager"
+		cfg.AlertTemplatePath = ""
+	})
+
+	payload := `{
+	  "receiver": "telegram-webhook-proxy",
+	  "status": "firing",
+	  "message": "<b>Prepared by Alertmanager</b>\nLine 2",
+	  "title": "fallback title",
+	  "alerts": []
+	}`
+
+	result, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(payload))
+	if err != nil {
+		t.Fatalf("AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+	if result.Status != store.StatusDelivered {
+		t.Fatalf("expected delivered status, got %s", result.Status)
+	}
+	texts := deps.client.Texts()
+	if len(texts) != 1 {
+		t.Fatalf("expected one Telegram send, got %d", len(texts))
+	}
+	if texts[0] != "<b>Prepared by Alertmanager</b>\nLine 2" {
+		t.Fatalf("expected passthrough alertmanager message, got %q", texts[0])
+	}
+}
+
+func TestAlertmanagerMessageSourceFallsBackToTitle(t *testing.T) {
+	deps := newServiceDepsAtPath(t, filepath.Join(t.TempDir(), "store.db"), &fakeTelegramClient{
+		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 4, ChatID: -100123}}},
+	}, func(cfg *config.Config) {
+		cfg.AlertMessageSource = "alertmanager"
+		cfg.AlertTemplatePath = ""
+	})
+
+	payload := `{
+	  "receiver": "telegram-webhook-proxy",
+	  "status": "firing",
+	  "title": "Alertmanager title fallback",
+	  "alerts": []
+	}`
+
+	_, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(payload))
+	if err != nil {
+		t.Fatalf("AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+	texts := deps.client.Texts()
+	if len(texts) != 1 || texts[0] != "Alertmanager title fallback" {
+		t.Fatalf("expected title fallback to be sent, got %#v", texts)
+	}
+}
+
+func TestAlertmanagerMessageSourceDoesNotRequireTemplateFile(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "store.db")
+	deps := newServiceDepsAtPath(t, dbPath, &fakeTelegramClient{
+		responses: []fakeTelegramResult{{message: telegram.SentMessage{MessageID: 5, ChatID: -100123}}},
+	}, func(cfg *config.Config) {
+		cfg.AlertMessageSource = "alertmanager"
+		cfg.AlertTemplatePath = filepath.Join(t.TempDir(), "missing.tmpl")
+	})
+
+	payload := `{
+	  "receiver": "telegram-webhook-proxy",
+	  "status": "firing",
+	  "message": "No template file needed",
+	  "alerts": []
+	}`
+
+	_, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(payload))
+	if err != nil {
+		t.Fatalf("AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+}
+
+func TestAlertmanagerMessageSourceFailsOnEmptyMessage(t *testing.T) {
+	deps := newServiceDepsAtPath(t, filepath.Join(t.TempDir(), "store.db"), &fakeTelegramClient{}, func(cfg *config.Config) {
+		cfg.AlertMessageSource = "alertmanager"
+		cfg.AlertTemplatePath = ""
+	})
+
+	payload := `{
+	  "receiver": "telegram-webhook-proxy",
+	  "status": "firing",
+	  "alerts": []
+	}`
+
+	result, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), []byte(payload))
+	if err != nil {
+		t.Fatalf("expected terminal failure without transport error, got %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200 for terminal failure, got %d", statusCode)
+	}
+	if result.Status != store.StatusFailed {
+		t.Fatalf("expected failed status, got %s", result.Status)
+	}
+	if deps.client.Calls() != 0 {
+		t.Fatalf("expected no Telegram sends, got %d", deps.client.Calls())
+	}
+}
+
+func TestAlertmanagerMessageSourceSplitsLongMessage(t *testing.T) {
+	deps := newServiceDepsAtPath(t, filepath.Join(t.TempDir(), "store.db"), &fakeTelegramClient{}, func(cfg *config.Config) {
+		cfg.AlertMessageSource = "alertmanager"
+		cfg.AlertTemplatePath = ""
+	})
+
+	longMessage := strings.Repeat("line with enough content to split safely\n", 200)
+	payloadBytes, err := json.Marshal(map[string]any{
+		"receiver": "telegram-webhook-proxy",
+		"status":   "firing",
+		"message":  longMessage,
+		"alerts":   []any{},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	_, statusCode, err := deps.alerts.AcceptWebhook(context.Background(), payloadBytes)
+	if err != nil {
+		t.Fatalf("AcceptWebhook() error = %v", err)
+	}
+	if statusCode != 200 {
+		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+	texts := deps.client.Texts()
+	if len(texts) < 2 {
+		t.Fatalf("expected message to be split into multiple parts, got %d", len(texts))
+	}
+	for _, text := range texts {
+		if len([]rune(text)) > alerttemplate.MaxTelegramMessageChars {
+			t.Fatalf("message part exceeds Telegram limit: %d", len([]rune(text)))
+		}
 	}
 }
 

@@ -17,6 +17,7 @@ const (
 	defaultLogLevel                       = "INFO"
 	defaultEnvironment                    = "production"
 	defaultAlertTemplatePath              = "templates/telegram_alert.tmpl"
+	defaultAlertMessageSource             = "template"
 	defaultMessageParseMode               = "HTML"
 	defaultBasicAuthRealm                 = "webhook-telegram-proxy"
 	defaultHTTPReadTimeout                = 5 * time.Second
@@ -52,6 +53,7 @@ type Config struct {
 	BasicAuthUsername          string
 	BasicAuthPassword          string
 	BasicAuthRealm             string
+	AlertMessageSource         string
 	AlertTemplatePath          string
 	MessageParseMode           string
 	HTTPReadTimeout            time.Duration
@@ -93,6 +95,7 @@ func Parse(args []string) (Config, error) {
 	fs.StringVar(&cfg.BasicAuthUsername, "basic-auth-username", envString("BASIC_AUTH_USERNAME", ""), "optional HTTP basic auth username")
 	fs.StringVar(&cfg.BasicAuthPassword, "basic-auth-password", envString("BASIC_AUTH_PASSWORD", ""), "optional HTTP basic auth password")
 	fs.StringVar(&cfg.BasicAuthRealm, "basic-auth-realm", envString("BASIC_AUTH_REALM", defaultBasicAuthRealm), "HTTP basic auth realm")
+	fs.StringVar(&cfg.AlertMessageSource, "alert-message-source", envString("ALERT_MESSAGE_SOURCE", defaultAlertMessageSource), "message source: template or alertmanager")
 	fs.StringVar(&cfg.AlertTemplatePath, "alert-template-path", envString("ALERT_TEMPLATE_PATH", defaultAlertTemplatePath), "path to Telegram alert template")
 	fs.StringVar(&cfg.MessageParseMode, "message-parse-mode", envString("MESSAGE_PARSE_MODE", defaultMessageParseMode), "Telegram parse mode")
 	fs.DurationVar(&cfg.HTTPReadTimeout, "http-read-timeout", envDuration("HTTP_READ_TIMEOUT", defaultHTTPReadTimeout), "HTTP read timeout")
@@ -152,7 +155,10 @@ func (c Config) Validate() error {
 	if err := validateTelegramProxyURL(c.TelegramProxyURL); err != nil {
 		problems = append(problems, err.Error())
 	}
-	if c.AlertTemplatePath == "" {
+	if c.AlertMessageSource != "template" && c.AlertMessageSource != "alertmanager" {
+		problems = append(problems, "alert message source must be either template or alertmanager")
+	}
+	if c.AlertMessageSource == "template" && c.AlertTemplatePath == "" {
 		problems = append(problems, "alert template path is required")
 	}
 	if (c.BasicAuthUsername == "") != (c.BasicAuthPassword == "") {
@@ -225,6 +231,10 @@ func (c Config) Address() string {
 
 func (c Config) BasicAuthEnabled() bool {
 	return c.BasicAuthUsername != "" && c.BasicAuthPassword != ""
+}
+
+func (c Config) UsesTemplateRenderer() bool {
+	return c.AlertMessageSource == "template"
 }
 
 func envString(key, fallback string) string {

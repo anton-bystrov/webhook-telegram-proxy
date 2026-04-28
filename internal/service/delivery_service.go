@@ -239,8 +239,8 @@ func (s *DeliveryService) ProcessEventByID(ctx context.Context, eventID string) 
 	return nil
 }
 
-// errRenderFatal signals that the stored payload or template produced a
-// message that will never succeed — fail hard rather than retry forever.
+// errRenderFatal signals that the stored payload or message-construction path
+// produced a result that will never succeed — fail hard rather than retry forever.
 var errRenderFatal = errors.New("render fatal")
 
 // ensureRenderedParts loads parts from the record if already rendered, or
@@ -266,8 +266,8 @@ func (s *DeliveryService) ensureRenderedParts(ctx context.Context, record store.
 		persistCtx, cancel := persistCtx(ctx, storeWriteTimeout)
 		defer cancel()
 		_ = s.store.MarkFailed(persistCtx, record.EventID, record.RenderedMessage, err.Error())
-		logger.Error("render template failed; marking failed", "error", err)
-		return nil, fmt.Errorf("%w: render template: %v", errRenderFatal, err)
+		logger.Error("build alert message failed; marking failed", "error", err)
+		return nil, fmt.Errorf("%w: build alert message: %v", errRenderFatal, err)
 	}
 
 	rendered := joinRendered(parts)
@@ -389,10 +389,17 @@ func (s *DeliveryService) RotateStore(ctx context.Context) error {
 }
 
 // buildMessages renders the alert batch into one or more Telegram-sized
-// messages. Renders each alert once (O(n)) and packs greedily by byte length
-// against the rendered header size, rather than re-rendering the whole
-// template for every incremental alert (O(n²)).
+// messages. In template mode it renders each alert once (O(n)) and packs
+// greedily by byte length against the rendered header size, rather than
+// re-rendering the whole template for every incremental alert (O(n²)).
 func (s *DeliveryService) buildMessages(payload models.WebhookPayload) ([]string, error) {
+	if s.cfg.AlertMessageSource == "alertmanager" {
+		return buildPassthroughMessages(payload)
+	}
+	if s.renderer == nil {
+		return nil, fmt.Errorf("template renderer is not configured")
+	}
+
 	data := s.renderer.BuildData(payload)
 
 	whole, err := s.renderer.Render(data)
@@ -475,6 +482,64 @@ func (s *DeliveryService) buildMessages(payload models.WebhookPayload) ([]string
 	}
 
 	return messages, nil
+}
+
+func buildPassthroughMessages(payload models.WebhookPayload) ([]string, error) {
+	message := strings.TrimSpace(payload.Message)
+	if message == "" {
+		message = strings.TrimSpace(payload.Title)
+	}
+	if message == "" {
+		return nil, fmt.Errorf("alertmanager message is empty")
+	}
+	return splitMessage(message, alerttemplate.MaxTelegramMessageChars), nil
+}
+
+func splitMessage(message string, limit int) []string {
+	if telegramChars(message) <= limit {
+		return []string{message}
+	}
+
+	var parts []string
+	remaining := strings.TrimSpace(message)
+	for remaining != "" {
+		if telegramChars(remaining) <= limit {
+			parts = append(parts, remaining)
+			break
+		}
+
+		cut := lastFittingCut(remaining, limit)
+		segment := remaining[:cut]
+		part := strings.TrimSpace(segment)
+		if part == "" {
+			segment = remaining[:cut]
+			part = strings.TrimSpace(segment)
+		}
+		parts = append(parts, part)
+		remaining = strings.TrimSpace(remaining[cut:])
+	}
+
+	return parts
+}
+
+func lastFittingCut(message string, limit int) int {
+	var (
+		lastWhitespace int
+		charCount      int
+	)
+	for index, char := range message {
+		if charCount == limit {
+			if lastWhitespace > 0 {
+				return lastWhitespace
+			}
+			return index
+		}
+		if char == '\n' || char == ' ' || char == '\t' {
+			lastWhitespace = index
+		}
+		charCount++
+	}
+	return len(message)
 }
 
 func (s *DeliveryService) handleSendError(ctx context.Context, record store.Record, parts []string, sendErr error, logger *slog.Logger) error {
