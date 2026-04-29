@@ -1,79 +1,51 @@
-{{- /* ─────────────────────────────────────────────────────────────
-   Alert template
-   ───────────────────────────────────────────────────────────── */ -}}
-
 {{- if gt .PartCount 1 -}}
 <b>📦 Part {{ .PartIndex }} of {{ .PartCount }}</b>
 
 {{ end -}}
-
-{{- /* ── Header: status · environment · counts ── */ -}}
-{{- $envName := env .CommonLabels -}}
-{{ statusIcon .Status }}{{ if $envName }} {{ envIcon $envName }} <b>{{ upper $envName }}</b>{{ end }}
+{{ .StatusIcon }}{{ if .EnvironmentName }} {{ .EnvironmentIcon }} <b>{{ .EnvironmentName }}</b>{{ end }}
 {{ .FiringCount }} firing{{ if .ResolvedCount }} · {{ .ResolvedCount }} resolved{{ end }}{{ if .TotalAlerts }} · {{ .TotalAlerts }} total{{ end }}
-
-{{- /* ── Group context (only labels shared by every alert) ── */ -}}
-{{- with filterLabels .CommonLabels }}
-<i>{{ joinPairs . }}</i>
+{{- if .GroupContext }}
+{{ .GroupContext }}
 {{- end }}
 {{- if .Message }}
 
 {{ .Message }}
 {{- end }}
 
-{{- /* ── Per-alert blocks ─────────────────────────────────── */ -}}
-{{ range $i, $a := .Alerts }}
+{{ range .Alerts }}
 ─────────────────────────────
-{{ severityIcon $a.Severity }} <b>{{ orDash $a.Name }}</b>
-{{- if $a.Severity }} · {{ $a.Severity }}{{ end -}}
-{{- if eq $a.Status "resolved" }} · ✅ resolved{{ end }}
-
-{{- /* Summary first — the headline for humans */ -}}
-{{- if $a.Summary }}
-{{ $a.Summary }}
+{{ severityIcon .Severity }} <b>{{ orDash .Name }}</b>{{ if .Severity }} · {{ .Severity }}{{ end }}{{ if eq .Status "resolved" }} · ✅ resolved{{ end }}
+{{- if .Summary }}
+{{ .Summary }}
 {{- end }}
+{{- if and .Description (ne .Description .Summary) }}
 
-{{- /* Description only if it actually adds info */ -}}
-{{- if and $a.Description (ne $a.Description $a.Summary) }}
-
-{{ truncate $a.Description 500 }}
+{{ truncate .Description 500 }}
 {{- end }}
+{{- if .WhereLines }}
 
-{{- /* Identity: where exactly is this happening */ -}}
-{{- $where := filterLabels $a.Labels }}
-{{- if $where }}
-
-<b>Where:</b> <b>{{ joinPairs $where }}</b>
+<b>Where:</b>
+{{- range .WhereLines }}
+{{ . }}
 {{- end }}
-
-{{- /* Value: actual measurement that triggered the rule */ -}}
-{{- if $a.ValueString }}
-<b>Value:</b> <b><code>{{ $a.ValueString }}</code></b>
 {{- end }}
+{{- if .ValueString }}
 
-{{- /* Time: when it started, how long it's been going */ -}}
-{{- if not (isZeroTime $a.StartsAt) }}
-<b>Since:</b> <b>{{ formatTime $a.StartsAt }} ({{ since $a.StartsAt }})</b>
+<b>Value:</b> <b><code>{{ .ValueString }}</code></b>
 {{- end }}
-{{- if and (eq $a.Status "resolved") (not (isZeroTime $a.EndsAt)) }}
-<b>Resolved:</b> {{ formatTime $a.EndsAt }} (lasted {{ duration $a.StartsAt $a.EndsAt }})
+{{- if .SinceUTC }}
+
+<b>Since:</b> <b>{{ .SinceUTC }}{{ if .SinceLocal }} ({{ .SinceLocal }}){{ end }}{{ if .SinceAgo }} ({{ .SinceAgo }}){{ end }}</b>
 {{- end }}
+{{- if .ResolvedUTC }}
+<b>Resolved:</b> {{ .ResolvedUTC }}{{ if .ResolvedLocal }} ({{ .ResolvedLocal }}){{ end }}{{ if .Duration }} (lasted {{ .Duration }}){{ end }}
+{{- end }}
+{{- if .ActionLinks }}
 
-{{- /* Actionable links: only those that exist, on one line */ -}}
-{{- $links := list -}}
-{{- if index $a.Annotations "runbook_url" }}{{ $links = append $links (printf "<a href=\"%s\">📕 runbook</a>" (index $a.Annotations "runbook_url")) }}{{ end -}}
-{{- if $a.GeneratorURL }}{{ $links = append $links (printf "<a href=\"%s\">📊 graph</a>" $a.GeneratorURL) }}{{ end -}}
-{{- if $a.DashboardURL }}{{ $links = append $links (printf "<a href=\"%s\">📈 dashboard</a>" $a.DashboardURL) }}{{ end -}}
-{{- if $a.PanelURL }}{{ $links = append $links (printf "<a href=\"%s\">🔍 panel</a>" $a.PanelURL) }}{{ end -}}
-{{- if $a.SilenceURL }}{{ $links = append $links (printf "<a href=\"%s\">🔕 silence</a>" $a.SilenceURL) }}{{ end -}}
-{{- if $links }}
-
-{{ join $links "  ·  " }}
+{{- range $index, $link := .ActionLinks }}{{ if $index }} · {{ end }}<a href="{{ $link.URL }}">{{ $link.Label }}</a>{{ end }}
 {{- end }}
 {{- end }}
 
-{{- /* ── Footer: only if alerts were truncated ────────────── */ -}}
 {{- if gt .TotalAlerts (len .Alerts) }}
-
 <i>… and {{ sub .TotalAlerts (len .Alerts) }} more alerts in this group</i>
 {{- end }}

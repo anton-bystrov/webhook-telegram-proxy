@@ -486,6 +486,7 @@ The main settings are listed below. See `.env.example` for a complete example.
 | `LOG_LEVEL` | `--log-level` | `INFO` | Log level |
 | `ENVIRONMENT` | `--environment` | `production` | Environment name |
 | `ALERT_MESSAGE_SOURCE` | `--alert-message-source` | `template` | Message source: `template` or `alertmanager` |
+| `ALERT_LOCAL_TIMEZONE` | `--alert-local-timezone` | empty | Optional IANA timezone for local alert timestamps, for example `Europe/Moscow` |
 | `ALERT_TEMPLATE_PATH` | `--alert-template-path` | `templates/telegram_alert.tmpl` | Path to the message template |
 | `MESSAGE_PARSE_MODE` | `--message-parse-mode` | `HTML` | Only `HTML` is supported in `v1` |
 
@@ -836,6 +837,8 @@ If both values are empty, delivery is marked as a terminal failure and is not re
 
 This mode is intended for Alertmanager setups where the final Telegram-friendly text is already produced by Alertmanager templates. The forwarded text must therefore already be valid for Telegram `HTML` parse mode.
 
+In `template` mode, the default layout is built from a presentation view-model prepared in Go: status and environment header, compact group context, structured `Where` lines, UTC plus local timestamps, and actionable links. Set `ALERT_LOCAL_TIMEZONE` if you want the local timestamp to use a specific zone such as `Europe/Moscow`.
+
 Message formatting lives in a separate file:
 
 ```text
@@ -875,6 +878,10 @@ The template receives a `MessageData` structure with these fields:
 | `Alerts` | list of individual alerts |
 | `PartIndex` | current message part number |
 | `PartCount` | total number of parts |
+| `StatusIcon` | precomputed icon for the batch status |
+| `EnvironmentName` | normalized uppercased environment name |
+| `EnvironmentIcon` | precomputed environment icon |
+| `GroupContext` | compact shared context line prepared for display |
 
 ### Per-alert fields
 
@@ -894,6 +901,14 @@ The template receives a `MessageData` structure with these fields:
 | `ValueString` | value string |
 | `Labels` | labels as `map[string]string` |
 | `Annotations` | annotations as `map[string]string` |
+| `WhereLines` | precomputed location lines such as `- namespace: foo` |
+| `SinceUTC` | alert start time in UTC |
+| `SinceLocal` | alert start time in configured local timezone |
+| `SinceAgo` | relative age like `39m ago` |
+| `ResolvedUTC` | resolved time in UTC |
+| `ResolvedLocal` | resolved time in configured local timezone |
+| `Duration` | alert duration |
+| `ActionLinks` | precomputed links for runbook, graph, dashboard, panel, and silence |
 
 ### Template helper functions
 
@@ -920,9 +935,11 @@ The template receives a `MessageData` structure with these fields:
 ### Example template fragment
 
 ```gotemplate
-{{- $envName := env .CommonLabels -}}
-{{ statusIcon .Status }}{{ if $envName }} {{ envIcon $envName }} <b>{{ upper $envName }}</b>{{ end }}
+{{ .StatusIcon }}{{ if .EnvironmentName }} {{ .EnvironmentIcon }} <b>{{ .EnvironmentName }}</b>{{ end }}
 {{ .FiringCount }} firing{{ if .ResolvedCount }} · {{ .ResolvedCount }} resolved{{ end }}{{ if .TotalAlerts }} · {{ .TotalAlerts }} total{{ end }}
+{{- if .GroupContext }}
+{{ .GroupContext }}
+{{- end }}
 {{- range .Alerts }}
 {{ severityIcon .Severity }} <b>{{ orDash .Name }}</b>
 {{- if .Summary }}

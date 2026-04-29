@@ -23,20 +23,28 @@ type Pair struct {
 }
 
 type AlertData struct {
-	Status       string
-	Name         string
-	Severity     string
-	Summary      string
-	Description  string
-	StartsAt     time.Time
-	EndsAt       time.Time
-	GeneratorURL string
-	SilenceURL   string
-	DashboardURL string
-	PanelURL     string
-	ValueString  string
-	Labels       map[string]string
-	Annotations  map[string]string
+	Status        string
+	Name          string
+	Severity      string
+	Summary       string
+	Description   string
+	StartsAt      time.Time
+	EndsAt        time.Time
+	GeneratorURL  string
+	SilenceURL    string
+	DashboardURL  string
+	PanelURL      string
+	ValueString   string
+	Labels        map[string]string
+	Annotations   map[string]string
+	WhereLines    []string
+	SinceUTC      string
+	SinceLocal    string
+	SinceAgo      string
+	ResolvedUTC   string
+	ResolvedLocal string
+	Duration      string
+	ActionLinks   []ActionLink
 }
 
 type MessageData struct {
@@ -55,24 +63,69 @@ type MessageData struct {
 	Alerts            []AlertData
 	PartIndex         int
 	PartCount         int
+	StatusIcon        string
+	EnvironmentName   string
+	EnvironmentIcon   string
+	GroupContext      string
+}
+
+type ActionLink struct {
+	Label string
+	URL   string
 }
 
 type Renderer struct {
-	path    string
-	tmpl    *template.Template
-	metrics *metrics.Metrics
+	path            string
+	tmpl            *template.Template
+	metrics         *metrics.Metrics
+	displayLocation *time.Location
 }
 
-var noisyLabelKeys = map[string]struct{}{
+var noisyLabels = map[string]struct{}{
+	// Already shown in the alert header
 	"alertname":          {},
-	"grafana_folder":     {},
 	"severity":           {},
 	"status":             {},
+	"grafana_folder":     {},
 	"folder":             {},
 	"rule_uid":           {},
 	"dashboard_uid":      {},
 	"panel_id":           {},
 	"__alert_rule_uid__": {},
+	"pod_template_hash":  {},
+	"__name__":           {},
+	"prometheus":         {},
+}
+
+var exporterPodPrefixes = []string{
+	"kube-prometheus-stack-kube-state-metrics-",
+	"kube-prometheus-stack-prometheus-node-exporter-",
+	"kube-prometheus-stack-operator-",
+	"kube-state-metrics-",
+	"node-exporter-",
+}
+
+var groupContextPriority = []string{
+	"namespace",
+	"cluster",
+	"service",
+	"team",
+	"environment",
+	"env",
+}
+
+var whereLabelPriority = []string{
+	"deployment",
+	"statefulset",
+	"daemonset",
+	"job_name",
+	"namespace",
+	"pod",
+	"container",
+	"instance",
+	"node",
+	"mount",
+	"device",
 }
 
 func Load(path string, m *metrics.Metrics) (*Renderer, error) {
@@ -106,10 +159,18 @@ func Load(path string, m *metrics.Metrics) (*Renderer, error) {
 	}
 
 	return &Renderer{
-		path:    path,
-		tmpl:    tmpl,
-		metrics: m,
+		path:            path,
+		tmpl:            tmpl,
+		metrics:         m,
+		displayLocation: time.Local,
 	}, nil
+}
+
+func (r *Renderer) SetDisplayLocation(location *time.Location) {
+	if location == nil {
+		location = time.Local
+	}
+	r.displayLocation = location
 }
 
 func (r *Renderer) Render(data MessageData) (string, error) {
@@ -132,23 +193,39 @@ func (r *Renderer) Render(data MessageData) (string, error) {
 func (r *Renderer) BuildData(payload models.WebhookPayload) MessageData {
 	alerts := make([]AlertData, 0, len(payload.Alerts))
 	for _, alert := range payload.Alerts {
+		labels := sanitizeStringMap(alert.Labels, 128, 1024)
+		annotations := sanitizeStringMap(alert.Annotations, 128, 2048)
+		startUTC, startLocal, startAgo := r.formatSince(alert.StartsAt)
+		resolvedUTC, resolvedLocal := r.formatResolved(alert.EndsAt)
+
 		alerts = append(alerts, AlertData{
-			Status:       sanitize(alert.Status, 32),
-			Name:         sanitize(firstNonEmpty(alert.Labels["alertname"], alert.Fingerprint, "unnamed-alert"), 256),
-			Severity:     sanitize(firstNonEmpty(alert.Labels["severity"], "unknown"), 64),
-			Summary:      sanitize(firstNonEmpty(alert.Annotations["summary"], alert.Annotations["message"]), 1024),
-			Description:  sanitize(alert.Annotations["description"], 4096),
-			StartsAt:     alert.StartsAt,
-			EndsAt:       alert.EndsAt,
-			GeneratorURL: sanitize(alert.GeneratorURL, 2048),
-			SilenceURL:   sanitize(alert.SilenceURL, 2048),
-			DashboardURL: sanitize(alert.DashboardURL, 2048),
-			PanelURL:     sanitize(alert.PanelURL, 2048),
-			ValueString:  sanitize(firstNonEmpty(alert.ValueString, formatValues(alert.Values)), 1024),
-			Labels:       sanitizeStringMap(alert.Labels, 128, 1024),
-			Annotations:  sanitizeStringMap(alert.Annotations, 128, 2048),
+			Status:        sanitize(alert.Status, 32),
+			Name:          sanitize(firstNonEmpty(alert.Labels["alertname"], alert.Fingerprint, "unnamed-alert"), 256),
+			Severity:      sanitize(firstNonEmpty(alert.Labels["severity"], "unknown"), 64),
+			Summary:       sanitize(firstNonEmpty(alert.Annotations["summary"], alert.Annotations["message"]), 1024),
+			Description:   sanitize(alert.Annotations["description"], 4096),
+			StartsAt:      alert.StartsAt,
+			EndsAt:        alert.EndsAt,
+			GeneratorURL:  sanitize(alert.GeneratorURL, 2048),
+			SilenceURL:    sanitize(alert.SilenceURL, 2048),
+			DashboardURL:  sanitize(alert.DashboardURL, 2048),
+			PanelURL:      sanitize(alert.PanelURL, 2048),
+			ValueString:   sanitize(firstNonEmpty(alert.ValueString, formatValues(alert.Values)), 1024),
+			Labels:        labels,
+			Annotations:   annotations,
+			WhereLines:    renderWhereLines(labels),
+			SinceUTC:      startUTC,
+			SinceLocal:    startLocal,
+			SinceAgo:      startAgo,
+			ResolvedUTC:   resolvedUTC,
+			ResolvedLocal: resolvedLocal,
+			Duration:      durationBetween(alert.StartsAt, alert.EndsAt),
+			ActionLinks:   buildActionLinks(annotations, sanitize(alert.GeneratorURL, 2048), sanitize(alert.DashboardURL, 2048), sanitize(alert.PanelURL, 2048), sanitize(alert.SilenceURL, 2048)),
 		})
 	}
+
+	commonLabels := sanitizeStringMap(payload.CommonLabels, 128, 1024)
+	envName := environmentName(commonLabels)
 
 	return MessageData{
 		Receiver:          sanitize(payload.Receiver, 128),
@@ -161,11 +238,15 @@ func (r *Renderer) BuildData(payload models.WebhookPayload) MessageData {
 		ResolvedCount:     payload.ResolvedCount(),
 		TotalAlerts:       len(payload.Alerts) + payload.TruncatedAlerts,
 		TruncatedAlerts:   payload.TruncatedAlerts,
-		CommonLabels:      sanitizeStringMap(payload.CommonLabels, 128, 1024),
+		CommonLabels:      commonLabels,
 		CommonAnnotations: sanitizeStringMap(payload.CommonAnnotations, 128, 2048),
 		Alerts:            alerts,
 		PartIndex:         1,
 		PartCount:         1,
+		StatusIcon:        statusIcon(payload.Status),
+		EnvironmentName:   strings.ToUpper(envName),
+		EnvironmentIcon:   envIcon(envName),
+		GroupContext:      renderGroupContext(commonLabels),
 	}
 }
 
@@ -186,6 +267,32 @@ func CloneWithAlerts(data MessageData, alerts []AlertData, partIndex, partCount 
 	clone.PartIndex = partIndex
 	clone.PartCount = partCount
 	return clone
+}
+
+func (r *Renderer) formatSince(value time.Time) (string, string, string) {
+	if value.IsZero() {
+		return "", "", ""
+	}
+	return formatUTCTime(value), r.formatLocalTime(value), sinceTime(value)
+}
+
+func (r *Renderer) formatResolved(value time.Time) (string, string) {
+	if value.IsZero() {
+		return "", ""
+	}
+	return formatUTCTime(value), r.formatLocalTime(value)
+}
+
+func (r *Renderer) formatLocalTime(value time.Time) string {
+	if value.IsZero() || r.displayLocation == nil {
+		return ""
+	}
+	local := value.In(r.displayLocation)
+	zone, _ := local.Zone()
+	if zone == "UTC" {
+		return ""
+	}
+	return local.Format("15:04 ") + zone
 }
 
 func sanitizeStringMap(values map[string]string, maxKeyLen, maxValueLen int) map[string]string {
@@ -278,6 +385,13 @@ func formatTemplateTime(value time.Time) string {
 	return value.Format("2006-01-02 15:04 MST")
 }
 
+func formatUTCTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format("2006-01-02 15:04 MST")
+}
+
 func sinceTime(value time.Time) string {
 	if value.IsZero() {
 		return ""
@@ -308,7 +422,10 @@ func filterLabels(values any) map[string]string {
 
 	filtered := make(map[string]string, len(source))
 	for key, value := range source {
-		if _, skip := noisyLabelKeys[strings.ToLower(key)]; skip {
+		if _, skip := noisyLabels[strings.ToLower(key)]; skip {
+			continue
+		}
+		if strings.EqualFold(key, "pod") && isExporterPod(value) {
 			continue
 		}
 		filtered[key] = value
@@ -317,6 +434,143 @@ func filterLabels(values any) map[string]string {
 		return nil
 	}
 	return filtered
+}
+
+func renderGroupContext(labels map[string]string) string {
+	selected := selectOnlyPreferredLabels(filterLabels(labels), groupContextPriority)
+	if len(selected) == 0 {
+		selected = filterLabels(labels)
+	}
+	if len(selected) == 0 {
+		return ""
+	}
+	return joinPairs(selected)
+}
+
+func renderWhereLines(labels map[string]string) []string {
+	filtered := filterLabels(labels)
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	lines := make([]string, 0, len(filtered))
+	for _, pair := range orderedLabelPairs(filtered, whereLabelPriority) {
+		lines = append(lines, fmt.Sprintf("- %s: %s", pair.Key, pair.Value))
+	}
+	return lines
+}
+
+func buildActionLinks(annotations map[string]string, generatorURL, dashboardURL, panelURL, silenceURL string) []ActionLink {
+	links := make([]ActionLink, 0, 5)
+	if url := strings.TrimSpace(annotations["runbook_url"]); url != "" {
+		links = append(links, ActionLink{Label: "📕 runbook", URL: url})
+	}
+	if generatorURL != "" {
+		links = append(links, ActionLink{Label: "📊 graph", URL: generatorURL})
+	}
+	if dashboardURL != "" {
+		links = append(links, ActionLink{Label: "📈 dashboard", URL: dashboardURL})
+	}
+	if panelURL != "" {
+		links = append(links, ActionLink{Label: "🔍 panel", URL: panelURL})
+	}
+	if silenceURL != "" {
+		links = append(links, ActionLink{Label: "🔕 silence", URL: silenceURL})
+	}
+	if len(links) == 0 {
+		return nil
+	}
+	return links
+}
+
+func selectPriorityLabels(source map[string]string, preferred []string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+
+	selected := make(map[string]string)
+	seen := make(map[string]struct{}, len(preferred))
+	for _, key := range preferred {
+		for sourceKey, value := range source {
+			if strings.EqualFold(sourceKey, key) {
+				selected[sourceKey] = value
+				seen[strings.ToLower(sourceKey)] = struct{}{}
+				break
+			}
+		}
+	}
+
+	for key, value := range source {
+		if _, ok := seen[strings.ToLower(key)]; ok {
+			continue
+		}
+		selected[key] = value
+	}
+
+	if len(selected) == 0 {
+		return nil
+	}
+	return selected
+}
+
+func selectOnlyPreferredLabels(source map[string]string, preferred []string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+
+	selected := make(map[string]string)
+	for _, key := range preferred {
+		for sourceKey, value := range source {
+			if strings.EqualFold(sourceKey, key) {
+				selected[sourceKey] = value
+				break
+			}
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+	return selected
+}
+
+func orderedLabelPairs(source map[string]string, preferred []string) []Pair {
+	if len(source) == 0 {
+		return nil
+	}
+
+	pairs := make([]Pair, 0, len(source))
+	seen := make(map[string]struct{}, len(source))
+	for _, key := range preferred {
+		for sourceKey, value := range source {
+			if strings.EqualFold(sourceKey, key) {
+				pairs = append(pairs, Pair{Key: sourceKey, Value: value})
+				seen[strings.ToLower(sourceKey)] = struct{}{}
+				break
+			}
+		}
+	}
+
+	remainder := make([]Pair, 0, len(source))
+	for key, value := range source {
+		if _, ok := seen[strings.ToLower(key)]; ok {
+			continue
+		}
+		remainder = append(remainder, Pair{Key: key, Value: value})
+	}
+	sort.Slice(remainder, func(i, j int) bool {
+		return remainder[i].Key < remainder[j].Key
+	})
+
+	return append(pairs, remainder...)
+}
+
+func isExporterPod(name string) bool {
+	for _, prefix := range exporterPodPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(value string, limit int) string {
