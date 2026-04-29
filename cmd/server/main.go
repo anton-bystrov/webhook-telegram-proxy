@@ -67,6 +67,7 @@ func main() {
 			logger.Error("load alert template", "error", err)
 			os.Exit(1)
 		}
+		renderer.SetDisplayLocation(cfg.AlertDisplayLocation())
 	}
 
 	telegramOptions := make([]telegram.Option, 0, 2)

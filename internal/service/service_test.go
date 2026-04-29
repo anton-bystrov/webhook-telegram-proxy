@@ -439,6 +439,7 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClien
 		TelegramBotToken:           "test-token",
 		TelegramChatID:             "-100123",
 		AlertMessageSource:         "template",
+		AlertLocalTimezone:         "Europe/Moscow",
 		AlertTemplatePath:          templatePath,
 		MessageParseMode:           "HTML",
 		HTTPReadTimeout:            time.Second,
@@ -484,6 +485,7 @@ func newServiceDepsAtPath(t *testing.T, dbPath string, client *fakeTelegramClien
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
+		renderer.SetDisplayLocation(cfg.AlertDisplayLocation())
 	}
 
 	delivery := NewDeliveryService(cfg, sqliteStore, renderer, client, registry, logger)

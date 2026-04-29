@@ -18,6 +18,7 @@ const (
 	defaultEnvironment                    = "production"
 	defaultAlertTemplatePath              = "templates/telegram_alert.tmpl"
 	defaultAlertMessageSource             = "template"
+	defaultAlertLocalTimezone             = ""
 	defaultMessageParseMode               = "HTML"
 	defaultBasicAuthRealm                 = "webhook-telegram-proxy"
 	defaultHTTPReadTimeout                = 5 * time.Second
@@ -54,6 +55,7 @@ type Config struct {
 	BasicAuthPassword          string
 	BasicAuthRealm             string
 	AlertMessageSource         string
+	AlertLocalTimezone         string
 	AlertTemplatePath          string
 	MessageParseMode           string
 	HTTPReadTimeout            time.Duration
@@ -96,6 +98,7 @@ func Parse(args []string) (Config, error) {
 	fs.StringVar(&cfg.BasicAuthPassword, "basic-auth-password", envString("BASIC_AUTH_PASSWORD", ""), "optional HTTP basic auth password")
 	fs.StringVar(&cfg.BasicAuthRealm, "basic-auth-realm", envString("BASIC_AUTH_REALM", defaultBasicAuthRealm), "HTTP basic auth realm")
 	fs.StringVar(&cfg.AlertMessageSource, "alert-message-source", envString("ALERT_MESSAGE_SOURCE", defaultAlertMessageSource), "message source: template or alertmanager")
+	fs.StringVar(&cfg.AlertLocalTimezone, "alert-local-timezone", envString("ALERT_LOCAL_TIMEZONE", defaultAlertLocalTimezone), "IANA timezone used for local alert timestamps, for example Europe/Moscow")
 	fs.StringVar(&cfg.AlertTemplatePath, "alert-template-path", envString("ALERT_TEMPLATE_PATH", defaultAlertTemplatePath), "path to Telegram alert template")
 	fs.StringVar(&cfg.MessageParseMode, "message-parse-mode", envString("MESSAGE_PARSE_MODE", defaultMessageParseMode), "Telegram parse mode")
 	fs.DurationVar(&cfg.HTTPReadTimeout, "http-read-timeout", envDuration("HTTP_READ_TIMEOUT", defaultHTTPReadTimeout), "HTTP read timeout")
@@ -154,6 +157,11 @@ func (c Config) Validate() error {
 	}
 	if err := validateTelegramProxyURL(c.TelegramProxyURL); err != nil {
 		problems = append(problems, err.Error())
+	}
+	if c.AlertLocalTimezone != "" {
+		if _, err := time.LoadLocation(c.AlertLocalTimezone); err != nil {
+			problems = append(problems, "alert local timezone must be a valid IANA timezone")
+		}
 	}
 	if c.AlertMessageSource != "template" && c.AlertMessageSource != "alertmanager" {
 		problems = append(problems, "alert message source must be either template or alertmanager")
@@ -235,6 +243,17 @@ func (c Config) BasicAuthEnabled() bool {
 
 func (c Config) UsesTemplateRenderer() bool {
 	return c.AlertMessageSource == "template"
+}
+
+func (c Config) AlertDisplayLocation() *time.Location {
+	if strings.TrimSpace(c.AlertLocalTimezone) == "" {
+		return time.Local
+	}
+	location, err := time.LoadLocation(c.AlertLocalTimezone)
+	if err != nil {
+		return time.Local
+	}
+	return location
 }
 
 func envString(key, fallback string) string {

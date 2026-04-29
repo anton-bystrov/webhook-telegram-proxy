@@ -29,6 +29,7 @@ func TestBuildDataPreservesTemplateFriendlyFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
+	renderer.SetDisplayLocation(time.FixedZone("MSK", 3*60*60))
 
 	data := renderer.BuildData(models.WebhookPayload{
 		Status:          "firing",
@@ -63,11 +64,32 @@ func TestBuildDataPreservesTemplateFriendlyFields(t *testing.T) {
 	if got := data.CommonLabels["environment"]; got != "prod" {
 		t.Fatalf("expected common environment label, got %q", got)
 	}
+	if data.StatusIcon != "🔥" {
+		t.Fatalf("expected firing status icon, got %q", data.StatusIcon)
+	}
+	if data.EnvironmentName != "PROD" {
+		t.Fatalf("expected normalized environment name, got %q", data.EnvironmentName)
+	}
+	if data.GroupContext != "service=api, environment=prod" && data.GroupContext != "environment=prod, service=api" {
+		t.Fatalf("expected group context, got %q", data.GroupContext)
+	}
 	if data.Alerts[0].StartsAt != start {
 		t.Fatalf("expected StartsAt to remain time.Time, got %v", data.Alerts[0].StartsAt)
 	}
 	if got := data.Alerts[0].Annotations["runbook_url"]; got == "" {
 		t.Fatal("expected annotations map to be available for template indexing")
+	}
+	if len(data.Alerts[0].WhereLines) == 0 {
+		t.Fatal("expected where lines to be precomputed")
+	}
+	if data.Alerts[0].SinceUTC != "2026-04-28 10:00 UTC" {
+		t.Fatalf("expected UTC timestamp, got %q", data.Alerts[0].SinceUTC)
+	}
+	if data.Alerts[0].SinceLocal != "13:00 MSK" {
+		t.Fatalf("expected local timestamp, got %q", data.Alerts[0].SinceLocal)
+	}
+	if len(data.Alerts[0].ActionLinks) != 1 {
+		t.Fatalf("expected one action link, got %d", len(data.Alerts[0].ActionLinks))
 	}
 }
 
@@ -111,6 +133,23 @@ func TestFilterLabelsAndEnvironmentHelpers(t *testing.T) {
 	}
 }
 
+func TestFilterLabelsDropsExporterPodButKeepsServiceContext(t *testing.T) {
+	filtered := filterLabels(map[string]string{
+		"pod":      "kube-prometheus-stack-prometheus-node-exporter-abc12",
+		"service":  "api",
+		"instance": "node-1",
+	})
+	if _, exists := filtered["pod"]; exists {
+		t.Fatal("expected exporter pod label to be filtered out")
+	}
+	if got := filtered["service"]; got != "api" {
+		t.Fatalf("expected service label to remain, got %q", got)
+	}
+	if got := filtered["instance"]; got != "node-1" {
+		t.Fatalf("expected instance label to remain, got %q", got)
+	}
+}
+
 func TestRenderEscapesAlertValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "alert.tmpl")
 	if err := os.WriteFile(path, []byte("{{ (index .Alerts 0).Summary }}"), 0o600); err != nil {
@@ -150,6 +189,7 @@ func TestRenderDefaultTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
+	renderer.SetDisplayLocation(time.FixedZone("MSK", 3*60*60))
 
 	start := time.Now().UTC().Add(-12 * time.Minute).Truncate(time.Minute)
 	data := renderer.BuildData(models.WebhookPayload{
@@ -191,9 +231,13 @@ func TestRenderDefaultTemplate(t *testing.T) {
 
 	expectedFragments := []string{
 		"🔥 🟥 <b>PROD</b>",
+		"service=payments",
 		"Disk usage is above 94%",
-		"<b>Where:</b> <b>instance=node-1, mount=/var</b>",
+		"<b>Where:</b>",
+		"- instance: node-1",
+		"- mount: /var",
 		"<code>A=94.1</code>",
+		"UTC (",
 		"📕 runbook",
 		"📊 graph",
 		"📈 dashboard",

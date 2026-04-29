@@ -127,6 +127,39 @@ func TestValidateRejectsUnsupportedAlertMessageSource(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsAlertLocalTimezone(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_TEMPLATE_PATH", "templates/telegram_alert.tmpl")
+	t.Setenv("STORE_PATH", "data/test.db")
+
+	cfg, err := Parse([]string{
+		"--alert-local-timezone", "Europe/Moscow",
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.AlertLocalTimezone != "Europe/Moscow" {
+		t.Fatalf("expected alert local timezone from flags, got %q", cfg.AlertLocalTimezone)
+	}
+	if got := cfg.AlertDisplayLocation().String(); got != "Europe/Moscow" {
+		t.Fatalf("expected loaded location, got %q", got)
+	}
+}
+
+func TestValidateRejectsInvalidAlertLocalTimezone(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat")
+	t.Setenv("ALERT_TEMPLATE_PATH", "templates/telegram_alert.tmpl")
+	t.Setenv("STORE_PATH", "data/test.db")
+	t.Setenv("ALERT_LOCAL_TIMEZONE", "Mars/Olympus")
+
+	_, err := Parse([]string{})
+	if err == nil {
+		t.Fatal("expected validation error for invalid alert local timezone")
+	}
+}
+
 func TestValidateRejectsUnsupportedTelegramProxyScheme(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
 	t.Setenv("TELEGRAM_CHAT_ID", "chat")
